@@ -10,8 +10,10 @@ Built entirely on **OpenCV** – no GUI frameworks, no other dependencies.
 
 ## Features
 
-- **Frame-accurate annotation**: every video frame can be addressed individually (arrow keys), regardless of the playback mode 
+- **Frame-accurate annotation**: every video frame can be addressed individually (arrow keys), regardless of the playback mode
 - **Four event types**: Takeoff (`o`), Landing (`l`), LED on (`t`), LED off (`f`)
+- **Resume existing annotations**: an already existing `<video>_events.csv` is loaded at startup and annotation continues seamlessly — nothing is ever lost by re-opening a video
+- **Metadata check before loading**: the CSV metadata (video file, FPS, total frames) is validated against the video; on a mismatch the existing CSV is never touched
 - **Two playback modes**:
   - **ECHTZEIT** ("real time") – playback is never slower than real time; if decoding falls behind, the player automatically jumps to the target frame (no cumulative drift)
   - **SKIP n** – every n-th frame is displayed (1–10× playback speed) for quickly reviewing long recording sessions
@@ -20,7 +22,10 @@ Built entirely on **OpenCV** – no GUI frameworks, no other dependencies.
   - **Yellow ticks** = annotated frames
   - **Red ticks** = illogical sequence (two takeoffs or two landings directly in a row)
 - **Plausibility check**: takeoff and landing must strictly alternate — every jump is exactly one flight phase — violations are reported live in the console and shown in red in the timeline
-- **Automatic, atomic saving**: after every change the data is written to `<video>_events.csv` (first `.tmp`, then `os.replace()`) – **no data loss on crash**, never half-finished CSV files
+- **Automatic, atomic saving**: after every change the data is written to the events CSV (first `.tmp`, then `os.replace()`) – **no data loss on crash**, never half-finished CSV files
+- **Writes only on change**: the CSV is rewritten only when annotations actually changed; opening and closing a video without changes leaves all files untouched
+- **Freely resizable window** (`WINDOW_NORMAL`); 4K videos are scaled down to max. 1280×720 at startup (aspect ratio is preserved)
+- **Caps Lock friendly**: letter keys work regardless of Caps Lock state (uppercase input is normalised)
 
 ## Installation
 
@@ -40,6 +45,20 @@ Without an argument the usage is printed to the console. If the video has no fra
 
 For flight-time validation, a high frame rate matters: record at the highest rate your camera supports (e.g. 240 fps) so that the frame quantisation error of the takeoff/landing timestamps stays well below the tolerance you want to validate against.
 
+## Resuming Annotations & Metadata Check
+
+When you open a video that already has an `<video>_events.csv` next to it, the tool behaves as follows:
+
+1. **Metadata match** (video file, FPS, total frames) → the existing annotations are loaded and annotation continues where you left off (`Loaded: … events, annotation continues`).
+2. **Metadata mismatch** (e.g. the CSV belongs to a different video, a re-encoded version, or a different frame rate) → an error message with the differing fields is printed to the console. The existing CSV is **never overwritten**; instead a new CSV with a suffix is written (`video_events_1.csv`, `video_events_2.csv`, …). Autosave, manual save and the final save on exit all target that same new file, so the original stays untouched.
+3. **Unreadable CSV** (corrupt file/encoding) → same behaviour as a mismatch: error message, old file kept, new suffixed CSV.
+
+Notes:
+
+- Fields the video itself does not report (unknown frame rate or frame count) are skipped in the check — a comparison against the fallback value (30 fps) would produce false conflicts.
+- An **empty CSV** (valid metadata, no events yet) is loaded normally.
+- Negative frame indices in the CSV are rejected with a console warning; the timestamp column is checked against `frame / fps` (tolerance 1 ms) — the **frame index is the source of truth**, a mismatching timestamp is only reported, not fatal.
+
 ## Keyboard Controls
 
 | Key | Function |
@@ -57,7 +76,7 @@ For flight-time validation, a high frame rate matters: record at the highest rat
 | **`1`–`9`, `0`** | Show every n-th frame (1–10), switches to SKIP |
 | **`q` / `ESC`** | Quit (saves automatically) |
 
-The playback mode can also be selected with the **slider below the video** (trackbar): position 0 = real time, position 1–10 = skip. When quitting via the window's X button or `q`/`ESC`, the data is always saved one final time.
+The playback mode can also be selected with the **slider below the video** (trackbar): position 0 = real time, position 1–10 = skip. When quitting via the window's X button or `q`/`ESC`, the data is saved one final time — but **only if annotations actually changed** during the session (`Finished. No changes, CSV not rewritten.` otherwise).
 
 ## CSV Output
 
@@ -79,6 +98,7 @@ Frame;Timestamp;Event
 - Metadata is written as comment lines at the top of the file and is cleanly skipped by pandas with `comment='#'`
 - Timestamps are in seconds with a **German decimal separator (comma)**, matching the format of the truth CSVs
 - Every timestamp is exactly reproducible: `timestamp = frame / fps`
+- Flight time per jump is simply the difference between a landing and the preceding takeoff
 - If the file is locked while saving (e.g. opened in Excel), a rescue copy is kept in `<video>_events.csv.tmp`
 
 Load the annotations in Python:
@@ -95,10 +115,21 @@ Takeoff and landing must **strictly alternate** — each jump consists of exactl
 
 ## Notes
 
-- Closing the window (X button) exits the program cleanly and performs a final save – even with an empty annotation list
+- Closing the window (X button) exits the program cleanly and performs a final save if there were changes – even with an empty annotation list
 - If the total frame count of the video is unknown, the program warns; the timeline scaling may then be inaccurate
 - At the end of the video, playback pauses automatically and jumps back to the start
 - Text overlays use OpenCV's built-in fonts, so German UI strings are written without umlauts
+
+## Troubleshooting
+
+| Problem | Solution |
+|---|---|
+| Command runs without any output, no window opens | The script file is incomplete — it must end with `if __name__ == "__main__": main()` (re-copy the full file) |
+| `Warning: unknown frame rate, assuming 30 fps` | The container reports no frame rate; the tool assumes 30 fps — convert the video (e.g. `ffmpeg -i in.mp4 -vf fps=240 -crf 18 out.mp4`) for exact timestamps |
+| Variable frame rate (VFR) footage | Many smartphones record VFR; the tool assumes a constant rate. Convert with FFmpeg first (see above) |
+| `WARNING: '…' is locked (opened in Excel?)` | Close the CSV in Excel; a rescue copy is kept in `<video>_events.csv.tmp` |
+| `ERROR: metadata of CSV … does not match the video` | The existing CSV was written for a different video/version — a new `_1` CSV is created automatically; sort out the old file manually if needed |
+| Arrow keys do nothing | Use the alternative keys `a` / `d` |
 
 ## German Terms Used in the Code
 
@@ -136,7 +167,7 @@ The code and its user interface are written in German. The following translation
 
 ## Related Project
 
-This annotator creates the ground-truth data for [**OpenToF**](https://github.com/nrother/OpenToF/) — an open source Time-of-Flight measurement system for trampolining that measures the flight time of every jump. The annotated takeoff/landing CSVs serve as the reference against which the OpenToF sensor data is validated.
+This annotator creates the ground-truth data for [**OpenToF**](https://github.com/nrother/OpenToF/) — an open source Time-of-Flight measurement system for trampolining that measures the flight time of every jump and aims to match the accuracy of competition ToF systems. The annotated takeoff/landing CSVs serve as the reference against which the OpenToF sensor data is validated.
 
 ## License
 
