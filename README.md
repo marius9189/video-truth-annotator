@@ -1,132 +1,143 @@
 # Video Truth Annotator
 
-A minimal, keyboard-driven video player for frame-accurate event annotation. Built to create ground-truth data for sensor validation — marking takeoffs, landings, and LED toggles for time synchronization — it works with any video file and outputs a clean, timestamped CSV. Every annotation is autosaved atomically, so a crash never costs you your work.
+A lean, keyboard-driven Python tool for **frame-by-frame annotation of trampoline videos** — built to create **video ground-truth data for flight-time (time-of-flight, ToF) measurement**.
 
-Developed for the [OpenToF](https://github.com/nrother/OpenToF/) time-of-flight measurement project, but fully usable as a standalone tool.
+It marks events such as **takeoff** (athlete leaves the trampoline bed), **landing** (feet touch the bed again), **LED on and LED off** (e.g. for sensor-board/video time synchronisation) and automatically writes them to a CSV file. The frame-accurate takeoff/landing pairs give you the reference flight times of every jump against which a ToF measurement system can be validated.
+
+Developed for the [**OpenToF**](https://github.com/nrother/OpenToF/) project — an open source Time-of-Flight measurement system for trampolining — but fully usable as a standalone tool for any frame-accurate annotation task.
+
+Built entirely on **OpenCV** – no GUI frameworks, no other dependencies.
 
 ## Features
 
-- **Frame-accurate stepping** — move one frame forward or backward with the arrow keys
-- **Millisecond-precise timestamps** — computed from the frame index and the video's frame rate, shown live on screen
-- **Play / pause** with the space bar, playback speed matched to the real frame duration
-- **Timeline scrubbing** — click or drag the progress bar at the bottom of the video to jump anywhere; marked frames are shown as yellow ticks
-- **Event marking** — four configurable event types: Takeoff, Landing, LED on, LED off (useful for hardware/video time synchronization via an LED)
-- **Visual feedback** — the current frame shows a clear marker bar when it is annotated, plus the time distance to the next upcoming event
-- **Crash-safe autosave** — the CSV is rewritten atomically after every single annotation; a half-written file can never exist
-- **Rich metadata** — video file, frame rate, frame duration, total frames, and creation date are written into the CSV as comment lines
+- **Frame-accurate annotation**: every video frame can be addressed individually (arrow keys), regardless of the playback mode 
+- **Four event types**: Takeoff (`o`), Landing (`l`), LED on (`t`), LED off (`f`)
+- **Two playback modes**:
+  - **ECHTZEIT** ("real time") – playback is never slower than real time; if decoding falls behind, the player automatically jumps to the target frame (no cumulative drift)
+  - **SKIP n** – every n-th frame is displayed (1–10× playback speed) for quickly reviewing long recording sessions
+- **Interactive timeline** (progress bar at the bottom):
+  - Click jumps to the position, click + drag scrubs through the video (pauses automatically)
+  - **Yellow ticks** = annotated frames
+  - **Red ticks** = illogical sequence (two takeoffs or two landings directly in a row)
+- **Plausibility check**: takeoff and landing must strictly alternate — every jump is exactly one flight phase — violations are reported live in the console and shown in red in the timeline
+- **Automatic, atomic saving**: after every change the data is written to `<video>_events.csv` (first `.tmp`, then `os.replace()`) – **no data loss on crash**, never half-finished CSV files
 
 ## Installation
 
-Requires Python 3.8 or newer.
+Only Python 3 with OpenCV is required:
 
-1. Install Python from [python.org](https://www.python.org/downloads/). On Windows, check **"Add Python to PATH"** in the installer.
-2. Install the only dependency:
-
-   ```bash
-   pip install opencv-python
-   ```
-
-3. Save the script as `video_truth_player.py` (or download it from this repository).
+```bash
+pip install opencv-python
+```
 
 ## Usage
 
-Run the script with your video file as the only argument:
-
 ```bash
-python video_truth_player.py take2.mov
+python video_truth_annotator.py <path/to/video.mp4>
 ```
 
-Switch to your working directory first:
+Without an argument the usage is printed to the console. If the video has no frame rate, 30 fps is assumed (console warning).
 
-```bat
-cd C:\OpenToF
-python video_truth_player.py take1.MOV
-```
+For flight-time validation, a high frame rate matters: record at the highest rate your camera supports (e.g. 240 fps) so that the frame quantisation error of the takeoff/landing timestamps stays well below the tolerance you want to validate against.
 
-If the video path contains spaces, wrap it in quotes.
+## Keyboard Controls
 
-The player window opens **paused** at frame 0.
-
-### Keyboard controls
-
-| Key | Action |
+| Key | Function |
 |---|---|
-| `Space` | Play / Pause |
-| `→` or `D` | One frame forward |
-| `←` or `A` | One frame backward |
-| `O` | Mark Takeoff on the current frame |
-| `L` | Mark Landing on the current frame |
-| `T` | Mark LED on (for board/video sync) |
-| `F` | Mark LED off |
-| `U` | Remove the annotation on the current frame |
-| `S` | Save CSV manually (autosave is always active) |
-| `Q` / `Esc` | Quit (saves automatically) |
+| **Space** | Play / Pause |
+| **Right arrow / `d`** | One frame forward |
+| **Left arrow / `a`** | One frame back |
+| **`o`** | Mark takeoff (feet leave the bed) |
+| **`l`** | Mark landing (feet touch the bed) |
+| **`t`** | Mark LED on |
+| **`f`** | Mark LED off |
+| **`u`** | Delete the annotation of the current frame |
+| **`s`** | Manually save the CSV (with status output) |
+| **`m`** | Toggle playback mode (ECHTZEIT ↔ SKIP) |
+| **`1`–`9`, `0`** | Show every n-th frame (1–10), switches to SKIP |
+| **`q` / `ESC`** | Quit (saves automatically) |
 
-### Mouse controls
+The playback mode can also be selected with the **slider below the video** (trackbar): position 0 = real time, position 1–10 = skip. When quitting via the window's X button or `q`/`ESC`, the data is always saved one final time.
 
-- **Click** anywhere in the progress bar at the bottom: jump to that position
-- **Click and drag**: scrub through the video (playback pauses automatically)
-- Yellow ticks on the progress bar show all annotated frames; a white marker shows the current position
+## CSV Output
 
-### On-screen display
+The annotations are written to `<video>_events.csv` (semicolon-separated) next to the video:
 
-- Top bar: current frame number, timestamp in seconds (millisecond precision, comma decimal separator to match the ground-truth CSV format), play/pause state, and a `[MARKIERT]` (marked) indicator
-- Second line: distance in milliseconds to the next annotated event
-- Bottom: orange bar with the event name when the current frame is annotated
-
-### Output format
-
-Annotations are written to `<video>_events.csv` next to the video file (e.g. `take1.mov` → `take1_events.csv`):
-
-```
-# Video: take1.mov
-# FPS: 29.970030
-# Frame-Dauer: 33.367 ms
-# Gesamtframes: 5400
-# Video-Dauer: 180.181 s
-# Erstellt: 2026-09-24T07:30:00
+```csv
+# Video: meinvideo.mp4
+# FPS: 30.000000
+# Frame-Dauer: 33.333 ms        (frame duration)
+# Gesamtframes: 900             (total frames)
+# Video-Dauer: 30.000 s         (video duration)
+# Erstellt: 2026-09-25T17:52:34 (created)
 Frame;Timestamp;Event
-286;9,568;Takeoff
-304;10,109;Landing
-369;12,300;LED on
+0;0,000;LED on
+120;4,000;Takeoff
+450;15,000;Landing
 ```
 
-- The `#` comment lines carry the metadata; the `Frame` column makes every timestamp exactly reproducible (`timestamp = frame / fps`), independent of rounding.
-- Load it in Python with:
+- Metadata is written as comment lines at the top of the file and is cleanly skipped by pandas with `comment='#'`
+- Timestamps are in seconds with a **German decimal separator (comma)**, matching the format of the truth CSVs
+- Every timestamp is exactly reproducible: `timestamp = frame / fps`
+- If the file is locked while saving (e.g. opened in Excel), a rescue copy is kept in `<video>_events.csv.tmp`
 
-  ```python
-  import pandas as pd
-  df = pd.read_csv("take1_events.csv", sep=";", comment="#")
-  ```
+Load the annotations in Python:
 
-## Tips for accurate annotation
+```python
+import pandas as pd
 
-- **Variable frame rate (VFR) videos:** many smartphones record with a fluctuating frame rate. The tool assumes a constant rate, so convert VFR footage first:
+df = pd.read_csv("meinvideo_events.csv", sep=";", comment="#")
+```
 
-  ```bash
-  ffmpeg -i take2.mov -vf fps=30000/1001 -crf 18 take2_cfr.mp4
-  ```
+## Plausibility Check (Takeoff/Landing)
 
-  A warning at startup ("unbekannte Framerate" or an implausible frame count) is a hint to check this.
-- **Don't keep the CSV open in Excel** while annotating — Windows locks the file, and the tool can only write a temporary backup copy until it is closed.
-- For millisecond-exact work, pause and step frame by frame instead of relying on playback timing.
+Takeoff and landing must **strictly alternate** — each jump consists of exactly one takeoff and one landing. If one takeoff is followed by another takeoff (or a landing by another landing), **both** annotations are marked as invalid – red in the timeline and as a warning in the console. LED events do not disturb the sequence and are not checked.
 
-## Troubleshooting
+## Notes
 
-| Problem | Solution |
+- Closing the window (X button) exits the program cleanly and performs a final save – even with an empty annotation list
+- If the total frame count of the video is unknown, the program warns; the timeline scaling may then be inaccurate
+- At the end of the video, playback pauses automatically and jumps back to the start
+- Text overlays use OpenCV's built-in fonts, so German UI strings are written without umlauts
+
+## German Terms Used in the Code
+
+The code and its user interface are written in German. The following translations apply:
+
+| German term (in code / UI) | English meaning |
 |---|---|
-| `can't open file … No such file or directory` | Check the exact filename, including hidden extensions (Windows hides `.txt` by default) |
-| `cd` doesn't switch drives (cmd) | Use `cd /d D:\OpenToF` or type `D:` first |
-| Video opens but shows garbage frames | Exotic codec; convert with FFmpeg (see above) |
-| Warning "unbekannte Framerate" | The container reports no frame rate; the tool assumes 30 fps — convert the video to fix the timestamps |
-| Arrow keys do nothing | Use the alternative keys `A` / `D` |
+| ECHTZEIT | Real time (playback mode) |
+| SKIP n / jeder n-te Frame | Skip / show every n-th frame |
+| Wiedergabemodus | Playback mode |
+| Fortschrittsleiste / Timeline | Progress bar / timeline |
+| Pfeil rechts / Pfeil links | Right arrow / left arrow |
+| Leertaste | Space bar |
+| Ein Frame vor / zurück | One frame forward / back |
+| Markieren / Markierung | Mark / annotation |
+| Löschen | Delete |
+| Speichern / Gespeichert | Save / saved |
+| Manuell gespeichert | Manually saved |
+| Beenden | Quit / exit |
+| Warnung | Warning |
+| Unlogische Sequenz | Illogical sequence |
+| zwei Takeoffs oder zwei Landungen hintereinander | two takeoffs or two landings in a row |
+| Fenster geschlossen | Window closed |
+| Kein Frame mehr lesbar, beende | No more frames readable, quitting |
+| Erstellt | Created |
+| Video-Dauer | Video duration |
+| Gesamtframes | Total frames |
+| Frame-Dauer | Frame duration |
+| Rettungskopie | Rescue copy |
+| Überschrieben | Overwritten |
+| Verwendung | Usage |
+| Warnung: unbekannte Framerate, nehme 30 fps an | Warning: unknown frame rate, assuming 30 fps |
+| zwischengespeichert | auto-saved (intermediate save) |
+| Frame-Anzahl unbekannt, Timeline-Skalierung ggf. ungenau | Frame count unknown, timeline scaling may be inaccurate |
 
-## Limitations
+## Related Project
 
-- Timestamps are derived from the frame index, so they are only as accurate as the container's frame rate metadata.
-- Text overlays use OpenCV's built-in fonts and therefore contain no special characters (German output strings are written without umlauts).
-- The tool reads but does not modify the video; no re-encoding takes place.
+This annotator creates the ground-truth data for [**OpenToF**](https://github.com/nrother/OpenToF/) — an open source Time-of-Flight measurement system for trampolining that measures the flight time of every jump. The annotated takeoff/landing CSVs serve as the reference against which the OpenToF sensor data is validated.
 
 ## License
 
-Released under the [MIT License](LICENSE).
+See [LICENSE](LICENSE) in the repository.
