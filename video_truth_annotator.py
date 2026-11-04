@@ -19,19 +19,7 @@ New compared to the original version:
     (dirty flag); opening and closing without changes no longer
     produces new suffixed files or touches the existing one.
 
-Controls:
-  Space            : Play / Pause
-  Right arrow / d  : one frame forward
-  Left arrow  / a  : one frame back
-  o                : mark Takeoff
-  l                : mark Landing
-  t                : mark LED on
-  f                : mark LED off
-  u                : delete the annotation of the current frame
-  s                : save CSV manually (with status output)
-  m                : toggle playback mode (ECHTZEIT <-> SKIP)
-  1 to 9, 0        : show every n-th frame (1-10), switch to SKIP
-  q / ESC          : quit
+Key controls: printed with --controls (or --help).
 
 Playback mode (also selectable via the slider below the video):
   ECHTZEIT : target time of each frame from an absolute time counter; if
@@ -87,6 +75,22 @@ RED = (0, 0, 255)       # timeline: illogical sequence
 CSV_SEP = ";"
 COMMENT_PREFIX = "#"
 TIMESTAMP_TOLERANCE_MS = 1.0  # max. deviation of the CSV timestamp column
+
+USAGE = "Usage: python video_truth_annotator.py <video/path>"
+
+CONTROLS = """Controls:
+  Space            : Play / Pause
+  Right arrow / d  : one frame forward
+  Left arrow  / a  : one frame back
+  o                : mark Takeoff
+  l                : mark Landing
+  t                : mark LED on
+  f                : mark LED off
+  u                : delete the annotation of the current frame
+  s                : save CSV manually (with status output)
+  m                : toggle playback mode (ECHTZEIT <-> SKIP)
+  1 to 9, 0        : show every n-th frame (1-10), switch to SKIP
+  q / ESC          : quit"""
 
 
 def normalize_key(key):
@@ -304,14 +308,24 @@ def invalid_flight_frames(events):
 
 
 def main():
-    if len(sys.argv) > 1 and sys.argv[1] in ("-h", "--help"):
-        print("Usage: python video_truth_annotator.py <video/path>")
+    args = sys.argv[1:]
+    if "-h" in args or "--help" in args:
+        print(USAGE)
         print()
         print(__doc__.strip())
+        print()
+        print(CONTROLS)
+        print("\nOptions:")
+        print("  -h, --help   show this help")
+        print("  --controls   show only the key controls")
         sys.exit(0)
 
-    if len(sys.argv) < 2:
-        print("Usage: python video_truth_annotator.py <video/path>")
+    if "--controls" in args:
+        print(CONTROLS)
+        sys.exit(0)
+
+    if not args:
+        print(USAGE)
         sys.exit(1)
 
     video_path = sys.argv[1]
@@ -455,10 +469,10 @@ def main():
     def set_mode_from_keys(new_mode, new_step):
         """Set mode via keyboard and synchronise the visible trackbar."""
         nonlocal play_mode, skip_step, play_start, play_start_idx
-        if new_mode == MODE_SKIP:
-            skip_step = new_step
         if new_mode == play_mode and (new_mode == MODE_REALTIME or new_step == skip_step):
             return
+        if new_mode == MODE_SKIP:
+            skip_step = new_step
         play_mode = new_mode
         if not paused and play_mode == MODE_REALTIME:
             play_start = time.perf_counter()
@@ -470,7 +484,8 @@ def main():
     # Slider below the video window: position 0 = real time,
     # positions 1-10 = every n-th frame (SKIP). OpenCV HighGUI has no
     # dropdown menus; a trackbar is the closest control element.
-    cv2.createTrackbar(TRACKBAR_NAME, WIN_NAME, 0, 10, set_playback_mode)
+    cv2.createTrackbar(TRACKBAR_NAME, WIN_NAME, skip_step, 10,
+                       set_playback_mode)
 
     while True:
         if frame is None:
