@@ -304,8 +304,14 @@ def invalid_flight_frames(events):
 
 
 def main():
+    if len(sys.argv) > 1 and sys.argv[1] in ("-h", "--help"):
+        print("Usage: python video_truth_annotator.py <video/path>")
+        print()
+        print(__doc__.strip())
+        sys.exit(0)
+
     if len(sys.argv) < 2:
-        print("Usage: python video_truth_annotator.py <video>")
+        print("Usage: python video_truth_annotator.py <video/path>")
         sys.exit(1)
 
     video_path = sys.argv[1]
