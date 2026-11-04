@@ -19,7 +19,7 @@ New compared to the original version:
     (dirty flag); opening and closing without changes no longer
     produces new suffixed files or touches the existing one.
 
-Key controls: printed with --controls (or --help).
+Key controls: printed with --controls.
 
 Playback mode (also selectable via the slider below the video):
   ECHTZEIT : target time of each frame from an absolute time counter; if
@@ -312,12 +312,9 @@ def main():
     if "-h" in args or "--help" in args:
         print(USAGE)
         print()
-        print(__doc__.strip())
-        print()
-        print(CONTROLS)
-        print("\nOptions:")
+        print("Options:")
         print("  -h, --help   show this help")
-        print("  --controls   show only the key controls")
+        print("  --controls   show the key controls")
         sys.exit(0)
 
     if "--controls" in args:
