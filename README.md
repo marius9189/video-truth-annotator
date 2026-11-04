@@ -1,5 +1,7 @@
 # Video Truth Annotator
 
+**AI-Generated**
+
 A lean, keyboard-driven Python tool for **frame-by-frame annotation of trampoline videos** — built to create **video ground-truth data for flight-time (time-of-flight, ToF) measurement**.
 
 It marks events such as **takeoff** (athlete leaves the trampoline bed), **landing** (feet touch the bed again), **LED on and LED off** (e.g. for sensor-board/video time synchronisation) and automatically writes them to a CSV file. The frame-accurate takeoff/landing pairs give you the reference flight times of every jump against which a ToF measurement system can be validated.
