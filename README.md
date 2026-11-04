@@ -41,6 +41,8 @@ pip install opencv-python
 
 ```bash
 python video_truth_annotator.py <path/to/video.mp4>
+python video_truth_annotator.py --help      # usage and options (-h works too)
+python video_truth_annotator.py --controls  # key controls
 ```
 
 Without an argument the usage is printed to the console. If the video has no frame rate, 30 fps is assumed (console warning).
