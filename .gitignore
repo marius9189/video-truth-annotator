@@ -1,0 +1,7 @@
+# Local user data - never published to GitHub
+.video_truth_annotator_flags.txt
+.video_truth_annotator_flags.txt.tmp
+
+# Python
+__pycache__/
+*.py[cod]

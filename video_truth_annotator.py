@@ -5,7 +5,7 @@ Video player for evaluating video ground-truth data.
 Events: Takeoff, Landing, LED on, LED off (for board synchronisation).
 Every event can carry an optional free-text flag (key c), e.g. the sensor
 name or a note about uncertainty; used flags are proposed as autocomplete
-and remembered across runs in ~/.video_truth_annotator_flags.txt.
+and remembered across runs in a flags file next to the script.
 
 New compared to the original version:
   - Custom free-text flag per annotation (key c) with autocomplete over a
@@ -83,8 +83,8 @@ COMMENT_PREFIX = "#"
 TIMESTAMP_TOLERANCE_MS = 1.0  # max. deviation of the CSV timestamp column
 
 # Free-text flag history (e.g. sensor names) proposed as autocomplete.
-# Stored in the user's home directory so it persists across videos/runs.
-FLAG_HISTORY_PATH = os.path.join(os.path.expanduser("~"),
+# Stored next to this script so it persists across videos/runs.
+FLAG_HISTORY_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)),
                                  ".video_truth_annotator_flags.txt")
 FLAG_HISTORY_MAX = 200   # keep at most this many entries
 FLAG_SUGGESTIONS = 6     # suggestions shown while typing a flag

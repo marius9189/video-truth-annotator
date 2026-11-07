@@ -96,7 +96,7 @@ Every mark (takeoff, landing, LED on/off) can carry an **optional free-text flag
 - **Set / change**: press **`c`** on an annotated frame. A text editor opens inside the video window; if a flag already exists it is **pre-filled** so you can edit or replace it.
 - **Controls in the editor**: printable ASCII is appended, **Backspace** deletes, **Enter** accepts, **Esc** cancels (leaves the flag unchanged). Accepting an **empty** text removes the flag — the mark itself stays.
 - **Autocomplete**: previously used flags (e.g. sensor names) are suggested below the input, filtered by what you typed (first 6 matches, most recent first). **Up/Down** highlights a suggestion and puts it straight into the input line; **Tab** does the same, cycling forward.
-- **History**: used flags are remembered in `~/.video_truth_annotator_flags.txt` (one per line, deduplicated, newest first, capped at 200) and persist across videos and program runs. Flags found in an existing CSV are merged into the history on load.
+- **History**: used flags are remembered in `.video_truth_annotator_flags.txt` **next to the script** (one per line, deduplicated, newest first, capped at 200) and persist across videos and program runs. Flags found in an existing CSV are merged into the history on load.
 - **Safety**: re-marking a frame with `o`/`l`/`t`/`f` keeps its existing flag; `u` deletes the event **and** its flag.
 - Overlay and console show the flag alongside the event (`Flag: …`).
 - Flags are **ASCII-only**: the flag is drawn with the OpenCV font (no umlauts), and the in-window editor accepts printable ASCII characters.
