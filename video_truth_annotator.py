@@ -3,8 +3,14 @@
 Video player for evaluating video ground-truth data.
 
 Events: Takeoff, Landing, LED on, LED off (for board synchronisation).
+Every event can carry an optional free-text flag (key c), e.g. the sensor
+name or a note about uncertainty; used flags are proposed as autocomplete
+and remembered across runs in ~/.video_truth_annotator_flags.txt.
 
 New compared to the original version:
+  - Custom free-text flag per annotation (key c) with autocomplete over a
+    persistent history of previously used flags; stored as a 4th CSV
+    column (Flag). Older 3-column CSVs without a flag remain readable.
   - At startup, an already existing <video>_events.csv is read in
     and annotation is continued (no more overwriting with an empty file).
   - Before loading, the CSV metadata is checked against the video
@@ -55,8 +61,8 @@ import cv2
 from datetime import datetime
 
 WIN_NAME = ("Video Truth Player - Space: Play/Pause, Arrows: Frame, "
-            "o/l: Takeoff/Landing, t/f: LED on/off, u: Delete, "
-            "s: Save, q: Quit")
+            "o/l: Takeoff/Landing, t/f: LED on/off, c: Flag, u: Delete, "
+            ",/.: Prev/Next mark, s: Save, q: Quit")
 TRACKBAR_NAME = "Playback mode (0=real time, 1-10=skip)"
 
 BAR_H = 28          # height of the progress bar at the bottom
@@ -76,17 +82,29 @@ CSV_SEP = ";"
 COMMENT_PREFIX = "#"
 TIMESTAMP_TOLERANCE_MS = 1.0  # max. deviation of the CSV timestamp column
 
+# Free-text flag history (e.g. sensor names) proposed as autocomplete.
+# Stored in the user's home directory so it persists across videos/runs.
+FLAG_HISTORY_PATH = os.path.join(os.path.expanduser("~"),
+                                 ".video_truth_annotator_flags.txt")
+FLAG_HISTORY_MAX = 200   # keep at most this many entries
+FLAG_SUGGESTIONS = 6     # suggestions shown while typing a flag
+
 USAGE = "Usage: python video_truth_annotator.py <video/path>"
 
 CONTROLS = """Controls:
   Space            : Play / Pause
   Right arrow / d  : one frame forward
   Left arrow  / a  : one frame back
+  PageDown / .     : jump to next annotation
+  PageUp   / ,     : jump to previous annotation
   o                : mark Takeoff
   l                : mark Landing
   t                : mark LED on
   f                : mark LED off
-  u                : delete the annotation of the current frame
+  c                : set/change the free-text flag of the current mark
+                     (e.g. sensor name); Enter=ok, Esc=cancel,
+                     Up/Down/Tab=pick a suggestion
+  u                : delete the annotation (with flag) of the current frame
   s                : save CSV manually (with status output)
   m                : toggle playback mode (ECHTZEIT <-> SKIP)
   1 to 9, 0        : show every n-th frame (1-10), switch to SKIP
@@ -105,6 +123,106 @@ def fmt_time(sec):
     return f"{sec:.3f}".replace(".", ",")
 
 
+def sanitize_flag(text):
+    """Strip characters that would break the semicolon CSV line format."""
+    return text.replace(CSV_SEP, ",").replace("\n", " ").replace("\r", " ").strip()
+
+
+def load_flag_history(path):
+    """Read the flag history (one flag per line); [] if missing/unreadable."""
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            return [line.strip() for line in f if line.strip()]
+    except (OSError, UnicodeDecodeError):
+        return []
+
+
+def save_flag_history(path, history):
+    """Write the flag history atomically (tmp file + os.replace)."""
+    tmp_path = path + ".tmp"
+    try:
+        with open(tmp_path, "w", encoding="utf-8") as f:
+            for flag in history:
+                f.write(flag + "\n")
+        os.replace(tmp_path, path)
+    except OSError as exc:
+        print(f"Warning: could not write flag history '{path}' ({exc}).")
+
+
+def update_flag_history(history, flag):
+    """Move `flag` to the front (case-insensitive dedupe), then cap the list."""
+    key = flag.lower()
+    history[:] = [f for f in history if f.lower() != key]
+    history.insert(0, flag)
+    del history[FLAG_HISTORY_MAX:]
+
+
+def autocomplete(text, history, limit=FLAG_SUGGESTIONS):
+    """History entries containing `text` (case-insensitive), recency first."""
+    needle = text.lower()
+    return [flag for flag in history if needle in flag.lower()][:limit]
+
+
+def edit_flag_text(base_display, event_name, initial, history):
+    """
+    In-window text editor for the free-text flag, with autocomplete over the
+    flag history. Returns (text, committed); committed=False means aborted
+    (Esc). Enter commits the typed text; an empty text removes the flag.
+    Keys: printable ASCII appends, Backspace deletes, Tab completes/cycles.
+    """
+    text = initial
+    prefix = initial   # text as typed; suggestions filter on this, so Tab
+    pick = -1          # or the arrow keys can cycle through suggestions
+    while True:
+        # window closed via X button -> abort the edit; the main loop then
+        # exits cleanly (with save)
+        if cv2.getWindowProperty(WIN_NAME, cv2.WND_PROP_VISIBLE) < 1:
+            return initial, False
+        display = base_display.copy()
+        h, w = display.shape[:2]
+        y0 = max(0, h - BAR_H - 230)
+        cv2.rectangle(display, (0, y0), (w, h - BAR_H), (30, 30, 140), -1)
+        cv2.putText(display, f"Flag for '{event_name}'  "
+                             f"(Enter=ok, Esc=cancel, Up/Down=select)",
+                    (10, y0 + 30), cv2.FONT_HERSHEY_SIMPLEX, 0.9,
+                    (255, 255, 255), 2, cv2.LINE_AA)
+        cv2.putText(display, text + "_", (20, y0 + 72),
+                    cv2.FONT_HERSHEY_SIMPLEX, 1.2, (0, 255, 255), 3, cv2.LINE_AA)
+        matches = autocomplete(prefix, history)
+        for i, candidate in enumerate(matches):
+            selected = (i == pick)
+            color = (0, 255, 255) if selected else (200, 200, 200)
+            cv2.putText(display, ("> " if selected else "  ") + candidate,
+                        (24, y0 + 104 + i * 22), cv2.FONT_HERSHEY_SIMPLEX,
+                        0.65, color, 2, cv2.LINE_AA)
+        cv2.imshow(WIN_NAME, display)
+        key = cv2.waitKeyEx(30) & 0xFFFFFFFF
+        if key in (13, 10):            # Enter -> commit
+            return text, True
+        if key == 27:                  # Esc -> abort
+            return initial, False
+        if key == 8:                   # Backspace
+            text = text[:-1]
+            prefix = text
+            pick = -1
+        elif key == 2621440:           # Down -> next suggestion into the input
+            if matches:
+                pick = 0 if pick < 0 else (pick + 1) % len(matches)
+                text = matches[pick]
+        elif key == 2490368:           # Up -> previous suggestion
+            if matches:
+                pick = len(matches) - 1 if pick < 0 else (pick - 1) % len(matches)
+                text = matches[pick]
+        elif key == 9:                 # Tab -> next suggestion (cycles)
+            if matches:
+                pick = (pick + 1) % len(matches)
+                text = matches[pick]
+        elif 32 <= key <= 126:         # printable ASCII
+            text += chr(key)
+            prefix = text
+            pick = -1
+
+
 def events_path_for(video_path):
     """Path of the events CSV belonging to the video (without suffix)."""
     base, _ = os.path.splitext(video_path)
@@ -116,7 +234,7 @@ def load_events(csv_path, fps):
     Read in an existing events CSV.
 
     Returns: (events_dict, metadata_dict, error)
-      events_dict  : {frame_index: event_name}
+      events_dict  : {frame_index: (event_name, flag)}
       metadata_dict: {"video": ..., "fps": ..., "gesamtframes": ...} or {}
       error        : None or description of why the file was not readable
 
@@ -125,6 +243,7 @@ def load_events(csv_path, fps):
       - the timestamp column is compared against frame/fps; deviations
         larger than TIMESTAMP_TOLERANCE_MS are reported (the frame
         index, not the timestamp, is the source of truth)
+      - files without the flag column (older CSVs) are read as flag ""
     """
     events = {}
     metadata = {}
@@ -143,9 +262,9 @@ def load_events(csv_path, fps):
                         key, _, value = content.partition(":")
                         metadata[key.strip().lower()] = value.strip()
                     continue
-                # data line: Frame;Timestamp;Event
-                parts = line.split(CSV_SEP)
-                if len(parts) != 3:
+                # data line: Frame;Timestamp;Event;Flag (Flag optional)
+                parts = line.split(CSV_SEP, 3)
+                if len(parts) < 3:
                     continue  # broken line -> skip
                 try:
                     frame_idx = int(parts[0].strip())
@@ -165,8 +284,9 @@ def load_events(csv_path, fps):
                 except ValueError:
                     pass  # no or malformed timestamp -> ignore, frame is valid
                 event_name = parts[2].strip()
+                flag = sanitize_flag(parts[3]) if len(parts) > 3 else ""
                 if event_name:
-                    events[frame_idx] = event_name
+                    events[frame_idx] = (event_name, flag)
         if rejected:
             print(f"Warning: {rejected} line(s) with negative frame index "
                   f"ignored in '{csv_path}'.")
@@ -259,9 +379,9 @@ def save_events(video_path, events, fps, total_frames, quiet=False,
         f.write(f"# Gesamtframes: {total_frames}\n")
         f.write(f"# Video-Dauer: {total_frames * frame_ms / 1000.0:.3f} s\n")
         f.write(f"# Erstellt: {datetime.now().isoformat(timespec='seconds')}\n")
-        f.write("Frame;Timestamp;Event\n")
-        for idx, name in sorted(events.items()):
-            f.write(f"{idx};{fmt_time(idx / fps)};{name}\n")
+        f.write("Frame;Timestamp;Event;Flag\n")
+        for idx, (name, flag) in sorted(events.items()):
+            f.write(f"{idx};{fmt_time(idx / fps)};{name};{sanitize_flag(flag)}\n")
 
     try:
         os.replace(tmp_path, out_path)  # atomic on all platforms
@@ -287,6 +407,15 @@ def do_seek(cap, target):
     return True, new_frame
 
 
+def neighbor_annotation(events, idx, direction):
+    """Frame index of the next (+1) or previous (-1) annotation, or None."""
+    if direction > 0:
+        candidates = [i for i in events if i > idx]
+        return min(candidates) if candidates else None
+    candidates = [i for i in events if i < idx]
+    return max(candidates) if candidates else None
+
+
 def invalid_flight_frames(events):
     """
     Return the frame indices whose takeoff/landing sequence is illogical.
@@ -297,8 +426,8 @@ def invalid_flight_frames(events):
     LED events do not disturb the sequence and are not checked.
     """
     invalid = set()
-    flight_seq = [(idx, name) for idx, name in sorted(events.items())
-                  if name in FLIGHT_EVENTS]
+    flight_seq = [(idx, entry[0]) for idx, entry in sorted(events.items())
+                  if entry[0] in FLIGHT_EVENTS]
     for (idx_a, name_a), (idx_b, name_b) in zip(flight_seq, flight_seq[1:]):
         if name_a == name_b:
             # two takeoffs or two landings in a row
@@ -346,7 +475,7 @@ def main():
     # --- Load existing CSV and check metadata --------------------------------
     default_csv = events_path_for(video_path)
     out_csv = default_csv           # target CSV for all later saves
-    events = {}                     # frame_index -> event_name
+    events = {}                     # frame_index -> (event_name, flag)
 
     if os.path.exists(default_csv):
         loaded, metadata, error = load_events(default_csv, fps)
@@ -378,6 +507,14 @@ def main():
             else:
                 print(f"Note: '{default_csv}' contains no events. "
                       f"Starting with an empty annotation.")
+
+    # --- Flag history (free text, e.g. sensor names) ------------------------
+    flag_history = load_flag_history(FLAG_HISTORY_PATH)
+    known = {f.lower() for f in flag_history}
+    for _, flag in events.values():          # harvest flags from loaded CSV
+        if flag and flag.lower() not in known:
+            flag_history.append(flag)
+            known.add(flag.lower())
 
     # Only write the CSV again if annotations actually changed
     dirty = False
@@ -435,11 +572,21 @@ def main():
         """Index of the currently displayed frame."""
         return int(cap.get(cv2.CAP_PROP_POS_FRAMES)) - 1
 
+    def jump_to_annotation(direction):
+        """Seek to the next (+1) or previous (-1) annotated frame."""
+        nonlocal ret, frame, paused
+        target = neighbor_annotation(events, cur_index(), direction)
+        if target is None:
+            print("No annotation in that direction.")
+            return
+        paused = True
+        ret, frame = do_seek(cap, target)
+
     def next_event_text(idx):
         """Short text: next annotated event including time distance."""
-        upcoming = [(i, n) for i, n in sorted(events.items()) if i > idx]
+        upcoming = [(i, entry) for i, entry in sorted(events.items()) if i > idx]
         if upcoming:
-            i, n = upcoming[0]
+            i, (n, _) = upcoming[0]
             return f"next: {n} in {(i - idx) * frame_time_ms:.0f} ms"
         return "no further events"
 
@@ -515,19 +662,33 @@ def main():
         cv2.rectangle(display, (pos_x - 2, bar_y0), (pos_x + 2, h),
                       (255, 255, 255), -1)
 
-        # annotation banner (orange) above the bar
+        # annotation banner (orange) above the bar, with the flag if present
         if idx in events:
-            cv2.rectangle(display, (0, h - BAR_H - 80), (w, h - BAR_H),
-                          (0, 120, 255), -1)
-            cv2.putText(display, f"MARKED: {events[idx]}",
-                        (10, h - BAR_H - 24), cv2.FONT_HERSHEY_SIMPLEX,
-                        1.6, (0, 0, 0), 4, cv2.LINE_AA)
+            name, flag = events[idx]
+            if flag:
+                cv2.rectangle(display, (0, h - BAR_H - 130), (w, h - BAR_H),
+                              (0, 120, 255), -1)
+                cv2.putText(display, f"MARKED: {name}",
+                            (10, h - BAR_H - 84), cv2.FONT_HERSHEY_SIMPLEX,
+                            1.6, (0, 0, 0), 4, cv2.LINE_AA)
+                cv2.putText(display, f"Flag: {flag}",
+                            (10, h - BAR_H - 24), cv2.FONT_HERSHEY_SIMPLEX,
+                            1.2, (0, 0, 0), 3, cv2.LINE_AA)
+            else:
+                cv2.rectangle(display, (0, h - BAR_H - 80), (w, h - BAR_H),
+                              (0, 120, 255), -1)
+                cv2.putText(display, f"MARKED: {name}",
+                            (10, h - BAR_H - 24), cv2.FONT_HERSHEY_SIMPLEX,
+                            1.6, (0, 0, 0), 4, cv2.LINE_AA)
 
         # overlay at the top: frame, time, status, playback mode
         total_txt = f"/{total_frames}" if frames_known else ""
         if idx in events:
+            name, flag = events[idx]
             marked = ("  [MARKED - ILLOGICAL SEQUENCE]" if idx in invalid_cache
                       else "  [MARKED]")
+            if flag:
+                marked += f"  flag: {flag}"
         else:
             marked = ""
         info = (f"Frame {idx}{total_txt}  "
@@ -583,6 +744,10 @@ def main():
         elif key == 2424832 or key == ord('a'):  # left arrow / a
             paused = True
             ret, frame = do_seek(cap, cur_index() - 1)
+        elif key == 2228224 or key == ord('.'):  # PageDown / .: next mark
+            jump_to_annotation(1)
+        elif key == 2162688 or key == ord(','):  # PageUp / ,: previous mark
+            jump_to_annotation(-1)
         elif key == ord('m'):
             # toggle mode
             set_mode_from_keys(
@@ -596,10 +761,13 @@ def main():
             idx = cur_index()
             name = {ord('o'): "Takeoff", ord('l'): "Landing",
                     ord('t'): "LED on", ord('f'): "LED off"}[key]
+            # re-marking an existing frame changes only the name, the
+            # already entered flag is kept
+            old_flag = events[idx][1] if idx in events else ""
             if idx in events:
-                print(f"Frame {idx} was already marked as '{events[idx]}' "
+                print(f"Frame {idx} was already marked as '{events[idx][0]}' "
                       f"-> overwritten")
-            events[idx] = name
+            events[idx] = (name, old_flag)
             print(f"{name} @ t = {fmt_time(idx / fps)} s (frame {idx})")
             invalid_cache = invalid_flight_frames(events)
             if idx in invalid_cache:
@@ -608,10 +776,36 @@ def main():
             dirty = True
             save_events(video_path, events, fps, total_frames, quiet=True,
                         out_path=out_csv)  # autosave
+        elif key == ord('c'):
+            idx = cur_index()
+            if idx not in events:
+                print("Current frame is not annotated - mark it first "
+                      "(o/l/t/f), then press c to add a flag.")
+            else:
+                paused = True  # no playback while editing
+                name, old_flag = events[idx]
+                text, committed = edit_flag_text(display, name, old_flag,
+                                                 flag_history)
+                if committed:
+                    new_flag = sanitize_flag(text)
+                    events[idx] = (name, new_flag)
+                    if new_flag:
+                        update_flag_history(flag_history, new_flag)
+                        save_flag_history(FLAG_HISTORY_PATH, flag_history)
+                        print(f"Flag @ frame {idx}: '{new_flag}'")
+                    else:
+                        print(f"Flag removed @ frame {idx}")
+                    dirty = True
+                    save_events(video_path, events, fps, total_frames,
+                                quiet=True, out_path=out_csv)  # autosave
+                else:
+                    print("Flag edit cancelled.")
         elif key == ord('u'):
             idx = cur_index()
             if idx in events:
-                print(f"Deleted: {events.pop(idx)} @ frame {idx}")
+                name, flag = events.pop(idx)
+                suffix = f" (flag: {flag})" if flag else ""
+                print(f"Deleted: {name}{suffix} @ frame {idx}")
                 invalid_cache = invalid_flight_frames(events)
                 dirty = True
                 save_events(video_path, events, fps, total_frames, quiet=True,

@@ -14,6 +14,7 @@ Built entirely on **OpenCV** – no GUI frameworks, no other dependencies.
 
 - **Frame-accurate annotation**: every video frame can be addressed individually (arrow keys), regardless of the playback mode
 - **Four event types**: Takeoff (`o`), Landing (`l`), LED on (`t`), LED off (`f`)
+- **Custom free-text flag per annotation** (`c`): attach any note to a mark — e.g. which sensor recorded it or a remark about an uncertain landing. Previously used flags are remembered across runs and offered as **autocomplete** while typing; stored as an extra CSV column (`Flag`)
 - **Resume existing annotations**: an already existing `<video>_events.csv` is loaded at startup and annotation continues seamlessly — nothing is ever lost by re-opening a video
 - **Metadata check before loading**: the CSV metadata (video file, FPS, total frames) is validated against the video; on a mismatch the existing CSV is never touched
 - **Two playback modes**:
@@ -24,6 +25,7 @@ Built entirely on **OpenCV** – no GUI frameworks, no other dependencies.
   - **Yellow ticks** = annotated frames
   - **Red ticks** = illogical sequence (two takeoffs or two landings directly in a row)
 - **Plausibility check**: takeoff and landing must strictly alternate — every jump is exactly one flight phase — violations are reported live in the console and shown in red in the timeline
+- **Jump between annotations**: `PageDown`/`.` and `PageUp`/`,` skip directly to the next/previous mark (handy for reviewing flags); playback pauses while jumping
 - **Automatic, atomic saving**: after every change the data is written to the events CSV (first `.tmp`, then `os.replace()`) – **no data loss on crash**, never half-finished CSV files
 - **Writes only on change**: the CSV is rewritten only when annotations actually changed; opening and closing a video without changes leaves all files untouched
 - **Freely resizable window** (`WINDOW_NORMAL`); 4K videos are scaled down to max. 1280×720 at startup (aspect ratio is preserved)
@@ -70,17 +72,34 @@ Notes:
 | **Space** | Play / Pause |
 | **Right arrow / `d`** | One frame forward |
 | **Left arrow / `a`** | One frame back |
+| **PageDown / `.`** | Jump to the next annotated frame |
+| **PageUp / `,`** | Jump to the previous annotated frame |
 | **`o`** | Mark takeoff (feet leave the bed) |
 | **`l`** | Mark landing (feet touch the bed) |
 | **`t`** | Mark LED on |
 | **`f`** | Mark LED off |
-| **`u`** | Delete the annotation of the current frame |
+| **`c`** | Set/change the free-text flag of the current mark |
+| **`u`** | Delete the annotation — event **and** flag — of the current frame |
 | **`s`** | Manually save the CSV (with status output) |
 | **`m`** | Toggle playback mode (ECHTZEIT ↔ SKIP) |
 | **`1`–`9`, `0`** | Show every n-th frame (1–10), switches to SKIP |
 | **`q` / `ESC`** | Quit (saves automatically) |
 
 The playback mode can also be selected with the **slider below the video** (trackbar): position 0 = real time, position 1–10 = skip. When quitting via the window's X button or `q`/`ESC`, the data is saved one final time — but **only if annotations actually changed** during the session (`Finished. No changes, CSV not rewritten.` otherwise).
+
+`PageDown`/`.` and `PageUp`/`,` jump to the next/previous annotated frame (pausing playback). A jump to a direction without further marks prints a note and stays put. Shift/Ctrl + arrow combinations are **not** usable for this: OpenCV's `waitKeyEx` only reports the bare arrow key code on Windows and drops the modifier, so dedicated keys are used instead.
+
+## Custom Flags (Free-Text Annotations)
+
+Every mark (takeoff, landing, LED on/off) can carry an **optional free-text flag**. This is useful when a video contains several sensors or when an event needs a comment:
+
+- **Set / change**: press **`c`** on an annotated frame. A text editor opens inside the video window; if a flag already exists it is **pre-filled** so you can edit or replace it.
+- **Controls in the editor**: printable ASCII is appended, **Backspace** deletes, **Enter** accepts, **Esc** cancels (leaves the flag unchanged). Accepting an **empty** text removes the flag — the mark itself stays.
+- **Autocomplete**: previously used flags (e.g. sensor names) are suggested below the input, filtered by what you typed (first 6 matches, most recent first). **Up/Down** highlights a suggestion and puts it straight into the input line; **Tab** does the same, cycling forward.
+- **History**: used flags are remembered in `~/.video_truth_annotator_flags.txt` (one per line, deduplicated, newest first, capped at 200) and persist across videos and program runs. Flags found in an existing CSV are merged into the history on load.
+- **Safety**: re-marking a frame with `o`/`l`/`t`/`f` keeps its existing flag; `u` deletes the event **and** its flag.
+- Overlay and console show the flag alongside the event (`Flag: …`).
+- Flags are **ASCII-only**: the flag is drawn with the OpenCV font (no umlauts), and the in-window editor accepts printable ASCII characters.
 
 ## CSV Output
 
@@ -93,11 +112,14 @@ The annotations are written to `<video>_events.csv` (semicolon-separated) next t
 # Gesamtframes: 900             (total frames)
 # Video-Dauer: 30.000 s         (video duration)
 # Erstellt: 2026-09-25T17:52:34 (created)
-Frame;Timestamp;Event
-0;0,000;LED on
-120;4,000;Takeoff
-450;15,000;Landing
+Frame;Timestamp;Event;Flag
+0;0,000;LED on;Sensor 2
+120;4,000;Takeoff;
+450;15,000;Landing;unsichere Landung
 ```
+
+- The `Flag` column holds the optional free-text flag (empty if none); semicolons and line breaks in a flag are replaced by `,`/space so the CSV stays well-formed
+- Files written by an older version (without the `Flag` column) are still read; their flags default to empty
 
 - Metadata is written as comment lines at the top of the file and is cleanly skipped by pandas with `comment='#'`
 - Timestamps are in seconds with a **German decimal separator (comma)**, matching the format of the truth CSVs
