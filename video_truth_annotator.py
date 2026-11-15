@@ -1,4 +1,10 @@
-#!/usr/bin/env python3
+#!/usr/bin/env -S uv run --script
+# /// script
+# requires-python = ">=3.9"
+# dependencies = [
+#     "opencv-python>=4.5",
+# ]
+# ///
 """
 Video player for evaluating video ground-truth data.
 
@@ -7,23 +13,13 @@ Every event can carry an optional free-text flag (key c), e.g. the sensor
 name or a note about uncertainty; used flags are proposed as autocomplete
 and remembered across runs in a flags file next to the script.
 
-New compared to the original version:
-  - Custom free-text flag per annotation (key c) with autocomplete over a
-    persistent history of previously used flags; stored as a 4th CSV
-    column (Flag). Older 3-column CSVs without a flag remain readable.
-  - At startup, an already existing <video>_events.csv is read in
-    and annotation is continued (no more overwriting with an empty file).
-  - Before loading, the CSV metadata is checked against the video
-    (FPS, total frames, video file). If they do not match, an error
-    message is printed to the console, the old CSV is left untouched
-    and a new CSV with a suffix is written instead (video_events_1.csv,
-    video_events_2.csv, ...). Fields that the video itself does not
-    report (unknown frame rate / frame count) are skipped in the check,
-    because a comparison against a fallback value would produce false
-    conflicts.
-  - The CSV is only rewritten when annotations actually changed
-    (dirty flag); opening and closing without changes no longer
-    produces new suffixed files or touches the existing one.
+Output: <video>.video_truth.csv next to the video. An existing file is
+loaded at startup and annotation continues; a legacy <video>_events.csv
+is loaded as a fallback (and from then on saved under the new name).
+The CSV metadata (video file, FPS, total frames) is checked first; on a
+mismatch the old CSV is left untouched and a numbered CSV is written
+instead (video.video_truth.1.csv, video.video_truth.2.csv, ...). Fields
+the video itself does not report are skipped in the check.
 
 Key controls: printed with --controls.
 
@@ -54,11 +50,13 @@ Note: the CSV metadata comment lines are deliberately kept in German
 existing truth CSVs and earlier files written by this tool.
 """
 
+import argparse
 import os
 import sys
 import time
-import cv2
 from datetime import datetime
+
+import cv2
 
 WIN_NAME = ("Video Truth Player - Space: Play/Pause, Arrows: Frame, "
             "o/l: Takeoff/Landing, t/f: LED on/off, c: Flag, u: Delete, "
@@ -89,7 +87,8 @@ FLAG_HISTORY_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)),
 FLAG_HISTORY_MAX = 200   # keep at most this many entries
 FLAG_SUGGESTIONS = 6     # suggestions shown while typing a flag
 
-USAGE = "Usage: python video_truth_annotator.py <video/path>"
+CSV_SUFFIX = ".video_truth"     # output: <video>.video_truth.csv
+LEGACY_CSV_SUFFIX = "_events"   # older versions wrote <video>_events.csv
 
 CONTROLS = """Controls:
   Space            : Play / Pause
@@ -223,10 +222,20 @@ def edit_flag_text(base_display, event_name, initial, history):
             pick = -1
 
 
-def events_path_for(video_path):
-    """Path of the events CSV belonging to the video (without suffix)."""
+def events_path_for(video_path, counter=0):
+    """
+    Path of the events CSV belonging to the video: video.video_truth.csv,
+    or video.video_truth.<counter>.csv for counter > 0.
+    """
     base, _ = os.path.splitext(video_path)
-    return base + "_events.csv"
+    suffix = f"{CSV_SUFFIX}.{counter}" if counter else CSV_SUFFIX
+    return base + suffix + ".csv"
+
+
+def legacy_events_path_for(video_path):
+    """Path of the CSV written by older versions (video_events.csv)."""
+    base, _ = os.path.splitext(video_path)
+    return base + LEGACY_CSV_SUFFIX + ".csv"
 
 
 def load_events(csv_path, fps):
@@ -347,31 +356,56 @@ def check_metadata_match(metadata, video_path, fps, total_frames,
 
 def find_free_events_path(video_path):
     """
-    Find the next free CSV path: video_events.csv,
-    then video_events_1.csv, video_events_2.csv, ...
+    Find the next free CSV path: video.video_truth.csv,
+    then video.video_truth.1.csv, video.video_truth.2.csv, ...
     """
-    base, _ = os.path.splitext(video_path)
-    candidate = base + "_events.csv"
-    counter = 1
-    while os.path.exists(candidate):
-        candidate = f"{base}_events_{counter}.csv"
+    counter = 0
+    while os.path.exists(events_path_for(video_path, counter)):
         counter += 1
-    return candidate
+    return events_path_for(video_path, counter)
 
 
 def save_events(video_path, events, fps, total_frames, quiet=False,
                 out_path=None):
     """
     Save atomically: first .tmp, then os.replace(). Never a half-written CSV.
-    out_path allows writing to a different CSV (e.g. video_events_1.csv
+    out_path allows writing to a different CSV (e.g. video.video_truth.1.csv
     after a metadata conflict).
+    Returns True on success, False if the file could not be written.
     """
     if out_path is None:
         out_path = events_path_for(video_path)
     tmp_path = out_path + ".tmp"
     frame_ms = 1000.0 / fps
 
-    with open(tmp_path, "w", encoding="utf-8") as f:
+    try:
+        _write_events_file(tmp_path, video_path, events, fps, total_frames,
+                           frame_ms)
+    except OSError as exc:
+        # e.g. read-only folder or full disk: keep running, report loudly
+        print(f"WARNING: could not write '{tmp_path}' ({exc}). "
+              f"Annotations are NOT saved yet.")
+        return False
+
+    try:
+        os.replace(tmp_path, out_path)  # atomic on all platforms
+    except PermissionError:
+        # CSV e.g. opened in Excel -> .tmp remains as a rescue copy
+        print(f"WARNING: '{out_path}' is locked (opened in Excel?). "
+              f"Rescue copy: {tmp_path}")
+        return False
+    except OSError as exc:
+        print(f"WARNING: could not replace '{out_path}' ({exc}). "
+              f"Rescue copy: {tmp_path}")
+        return False
+    if not quiet:
+        print(f"Saved: {out_path} ({len(events)} events)")
+    return True
+
+
+def _write_events_file(path, video_path, events, fps, total_frames, frame_ms):
+    """Write metadata header and event lines to `path`."""
+    with open(path, "w", encoding="utf-8") as f:
         # metadata as comment lines (pandas: comment='#')
         f.write(f"# Video: {os.path.basename(video_path)}\n")
         f.write(f"# FPS: {fps:.6f}\n")
@@ -382,15 +416,6 @@ def save_events(video_path, events, fps, total_frames, quiet=False,
         f.write("Frame;Timestamp;Event;Flag\n")
         for idx, (name, flag) in sorted(events.items()):
             f.write(f"{idx};{fmt_time(idx / fps)};{name};{sanitize_flag(flag)}\n")
-
-    try:
-        os.replace(tmp_path, out_path)  # atomic on all platforms
-        if not quiet:
-            print(f"Saved: {out_path} ({len(events)} events)")
-    except PermissionError:
-        # CSV e.g. opened in Excel -> .tmp remains as a rescue copy
-        print(f"WARNING: '{out_path}' is locked (opened in Excel?). "
-              f"Rescue copy: {tmp_path}")
 
 
 def do_seek(cap, target):
@@ -436,25 +461,25 @@ def invalid_flight_frames(events):
     return invalid
 
 
-def main():
-    args = sys.argv[1:]
-    if "-h" in args or "--help" in args:
-        print(USAGE)
-        print()
-        print("Options:")
-        print("  -h, --help   show this help")
-        print("  --controls   show the key controls")
-        sys.exit(0)
-
-    if "--controls" in args:
+def parse_args(argv=None):
+    parser = argparse.ArgumentParser(
+        description="Frame-accurate video annotation (takeoff, landing, "
+                    "LED on/off) to <video>.video_truth.csv.")
+    parser.add_argument("video", nargs="?", help="path to the video file")
+    parser.add_argument("--controls", action="store_true",
+                        help="show the key controls and exit")
+    args = parser.parse_args(argv)
+    if args.controls:
         print(CONTROLS)
         sys.exit(0)
-
-    if not args:
-        print(USAGE)
+    if args.video is None:
+        parser.print_usage()
         sys.exit(1)
+    return args
 
-    video_path = sys.argv[1]
+
+def main():
+    video_path = parse_args().video
     cap = cv2.VideoCapture(video_path)
     if not cap.isOpened():
         print(f"Error: could not open video '{video_path}'.")
@@ -477,10 +502,19 @@ def main():
     out_csv = default_csv           # target CSV for all later saves
     events = {}                     # frame_index -> (event_name, flag)
 
-    if os.path.exists(default_csv):
-        loaded, metadata, error = load_events(default_csv, fps)
+    # source to resume from: the current file name, else a legacy
+    # <video>_events.csv (read only; saves go to the new name)
+    src_csv = default_csv
+    legacy_csv = legacy_events_path_for(video_path)
+    if not os.path.exists(default_csv) and os.path.exists(legacy_csv):
+        src_csv = legacy_csv
+        print(f"Note: found legacy CSV '{legacy_csv}'; it is kept unchanged, "
+              f"changes are saved to '{default_csv}'.")
+
+    if os.path.exists(src_csv):
+        loaded, metadata, error = load_events(src_csv, fps)
         if error is not None:
-            print(f"ERROR: existing CSV '{default_csv}' could not be read "
+            print(f"ERROR: existing CSV '{src_csv}' could not be read "
                   f"({error}). A new CSV will be written; the existing "
                   f"file remains unchanged.")
             out_csv = find_free_events_path(video_path)
@@ -490,7 +524,7 @@ def main():
                 metadata, video_path, fps, total_frames,
                 fps_known=fps_known, frames_known=frames_known)
             if mismatches:
-                print(f"ERROR: metadata of CSV '{default_csv}' does not "
+                print(f"ERROR: metadata of CSV '{src_csv}' does not "
                       f"match the video:")
                 for m in mismatches:
                     print(f"  - {m}")
@@ -502,10 +536,10 @@ def main():
                 print(f"  {out_csv}")
             elif loaded:
                 events = loaded
-                print(f"Loaded: {default_csv} ({len(events)} events, "
+                print(f"Loaded: {src_csv} ({len(events)} events, "
                       f"annotation continues)")
             else:
-                print(f"Note: '{default_csv}' contains no events. "
+                print(f"Note: '{src_csv}' contains no events. "
                       f"Starting with an empty annotation.")
 
     # --- Flag history (free text, e.g. sensor names) ------------------------
@@ -516,8 +550,11 @@ def main():
             flag_history.append(flag)
             known.add(flag.lower())
 
-    # Only write the CSV again if annotations actually changed
-    dirty = False
+    # Every change is autosaved immediately. `changed`: any change this
+    # session; `unsaved`: the last save failed (e.g. CSV locked in Excel)
+    # -> retried on exit.
+    changed = False
+    unsaved = False
 
     paused = True
     play_mode = MODE_SKIP   # current playback mode
@@ -773,9 +810,9 @@ def main():
             if idx in invalid_cache:
                 print("WARNING: illogical sequence - two takeoffs or two "
                       "landings in a row! (red in the timeline)")
-            dirty = True
-            save_events(video_path, events, fps, total_frames, quiet=True,
-                        out_path=out_csv)  # autosave
+            changed = True
+            unsaved = not save_events(video_path, events, fps, total_frames,
+                                      quiet=True, out_path=out_csv)  # autosave
         elif key == ord('c'):
             idx = cur_index()
             if idx not in events:
@@ -795,9 +832,10 @@ def main():
                         print(f"Flag @ frame {idx}: '{new_flag}'")
                     else:
                         print(f"Flag removed @ frame {idx}")
-                    dirty = True
-                    save_events(video_path, events, fps, total_frames,
-                                quiet=True, out_path=out_csv)  # autosave
+                    changed = True
+                    unsaved = not save_events(
+                        video_path, events, fps, total_frames,
+                        quiet=True, out_path=out_csv)  # autosave
                 else:
                     print("Flag edit cancelled.")
         elif key == ord('u'):
@@ -807,16 +845,17 @@ def main():
                 suffix = f" (flag: {flag})" if flag else ""
                 print(f"Deleted: {name}{suffix} @ frame {idx}")
                 invalid_cache = invalid_flight_frames(events)
-                dirty = True
-                save_events(video_path, events, fps, total_frames, quiet=True,
-                            out_path=out_csv)  # autosave
+                changed = True
+                unsaved = not save_events(
+                    video_path, events, fps, total_frames,
+                    quiet=True, out_path=out_csv)  # autosave
             else:
                 print("Current frame is not annotated.")
         elif key == ord('s'):
-            save_events(video_path, events, fps, total_frames, quiet=True,
-                        out_path=out_csv)
-            print("Saved manually.")
-            dirty = False  # just saved -> nothing unsaved anymore
+            if save_events(video_path, events, fps, total_frames,
+                           quiet=True, out_path=out_csv):
+                print("Saved manually.")
+                unsaved = False
 
         if not paused:
             if play_mode == MODE_SKIP:
@@ -856,14 +895,18 @@ def main():
     cap.release()
     cv2.destroyAllWindows()
 
-    # Final save - only if annotations actually changed since loading.
-    # In a conflict case (suffixed CSV) this prevents empty _1/_2 files
-    # when the user merely opened and closed the video.
-    if dirty:
-        save_events(video_path, events, fps, total_frames, quiet=True,
-                    out_path=out_csv)
+    # Changes are autosaved, so a final save is only needed to retry a
+    # failed one. Without changes nothing is written (no empty .1/.2 files
+    # when a video is merely opened and closed).
+    if unsaved and not save_events(video_path, events, fps, total_frames,
+                                   quiet=True, out_path=out_csv):
+        print("Finished. WARNING: last changes could NOT be saved "
+              "(see rescue copy above).")
+    elif changed:
         print(f"Finished. {len(events)} events in {out_csv}")
     else:
         print("Finished. No changes, CSV not rewritten.")
+
+
 if __name__ == "__main__":
     main()
