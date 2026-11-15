@@ -36,8 +36,8 @@ Playback mode (also selectable via the slider below the video):
 Timeline:
   Clicking the bar at the bottom jumps to that position, click + drag scrubs
   through the video (pauses automatically). Hovering shows the frame and time
-  under the mouse. Yellow ticks = annotated frames, RED ticks = illogical
-  sequence (two takeoffs or two landings directly in a row, without the
+  under the mouse. Tick color by event type (Takeoff light blue, Landing
+  magenta, LED on yellow, LED off orange), RED ticks = illogical sequence (two takeoffs or two landings directly in a row, without the
   respective counterpart in between).
 
 Window freely resizable (WINDOW_NORMAL); 4K videos are scaled down to a
@@ -98,8 +98,16 @@ MODE_SKIP = "skip"          # every n-th frame, n-fold speed
 
 FLIGHT_EVENTS = ("Takeoff", "Landing")  # must strictly alternate
 
-YELLOW = (0, 255, 255)   # timeline: valid annotation
-RED = (0, 0, 255)        # timeline: illogical sequence
+YELLOW = (0, 255, 255)
+RED = (0, 0, 255)        # timeline: illogical sequence (overrides type color)
+# timeline tick color per event type (BGR); unknown names from a CSV: grey
+TICK_COLORS = {
+    "Takeoff": (255, 170, 0),   # light blue
+    "Landing": (255, 0, 255),   # magenta
+    "LED on": (0, 255, 255),    # yellow
+    "LED off": (0, 140, 255),   # orange
+}
+TICK_COLOR_OTHER = (200, 200, 200)
 GREEN = (0, 220, 0)
 CYAN = (255, 255, 0)
 WHITE = (255, 255, 255)
@@ -135,7 +143,7 @@ CONTROLS = """Controls:
   Right arrow / d  : one frame forward
   Left arrow  / a  : one frame back
   PageDown / .     : jump to next annotation
-  PageUp   / ,     : jump to previous annotation
+  PageUp   / ,     : jump to previous annotation (or to the start)
   o                : mark Takeoff
   l                : mark Landing
   t                : mark LED on
@@ -213,6 +221,18 @@ def fit_text(text, max_w, scale, thickness, keep_end=False):
 
 def put_text(img, text, x, y, scale, color, thickness):
     cv2.putText(img, text, (x, y), FONT, scale, color, thickness, cv2.LINE_AA)
+
+
+def put_segments(img, segments, x, y, max_x, scale, thickness):
+    """Draw (text, color) segments in one line; truncate at max_x."""
+    for text, color in segments:
+        fitted = fit_text(text, max_x - x, scale, thickness)
+        if not fitted:
+            break
+        put_text(img, fitted, x, y, scale, color, thickness)
+        if fitted != text:
+            break
+        x += text_width(text, scale, thickness)
 
 
 def darken(img, y0, y1, alpha=0.35):
@@ -916,21 +936,42 @@ def main():
         play_start_idx = src.idx
 
     def jump_to_annotation(direction):
-        """Seek to the next (+1) or previous (-1) annotated frame."""
+        """Seek to the next (+1) or previous (-1) annotated frame; without
+        a previous mark, go to the start of the video."""
         nonlocal paused
         target = neighbor_annotation(marks, src.idx, direction)
+        if target is None and direction < 0 and src.idx > 0:
+            target = 0
         if target is None:
             print("No annotation in that direction.")
             return
         paused = True
         src.goto(target)
 
-    def next_event_text(idx):
-        """Short text: next annotated event including time distance."""
-        i = neighbor_annotation(marks, idx, 1)
-        if i is None:
-            return "no further events"
-        return f"next: {events[i][0]} in {(i - idx) * frame_time_ms:.0f} ms"
+    def neighbor_segments(idx):
+        """Overlay text for the previous and next mark as (text, color)
+        segments; event names in their timeline color."""
+        segs = []
+        p = neighbor_annotation(marks, idx, -1)
+        if p is None:
+            segs.append(("last: none", CYAN))
+        else:
+            name = events[p][0]
+            segs += [("last: ", CYAN),
+                     (name, RED if p in invalid_cache else
+                      TICK_COLORS.get(name, TICK_COLOR_OTHER)),
+                     (f" {(idx - p) * frame_time_ms:.0f} ms ago", CYAN)]
+        segs.append(("   |   ", (150, 150, 150)))
+        n = neighbor_annotation(marks, idx, 1)
+        if n is None:
+            segs.append(("next: none", CYAN))
+        else:
+            name = events[n][0]
+            segs += [("next: ", CYAN),
+                     (name, RED if n in invalid_cache else
+                      TICK_COLORS.get(name, TICK_COLOR_OTHER)),
+                     (f" in {(n - idx) * frame_time_ms:.0f} ms", CYAN)]
+        return segs
 
     def mode_text():
         if play_mode == MODE_REALTIME:
@@ -973,7 +1014,8 @@ def main():
             scale = max(total_frames - 1, 1)
             for mi in marks:
                 mx = int(round(min(mi / scale, 1.0) * (w - 1)))
-                color = RED if mi in invalid_cache else YELLOW
+                color = (RED if mi in invalid_cache else
+                         TICK_COLORS.get(events[mi][0], TICK_COLOR_OTHER))
                 for layer in (grey, green):
                     cv2.rectangle(layer, (mx - hw, 0), (mx + hw, bar_h), color, -1)
             bar_cache.update(key=key, grey=grey, green=green)
@@ -1004,8 +1046,8 @@ def main():
                 f"[{'PAUSE' if paused else 'PLAY'}]   {mode_text()}")
         put_text(canvas, fit_text(info, cw - 2 * pad, s1, t1),
                  pad, pad + h1, s1, GREEN, t1)
-        put_text(canvas, fit_text(next_event_text(idx), cw - 2 * pad, s2, t2),
-                 pad, 2 * pad + h1 + h2, s2, CYAN, t2)
+        put_segments(canvas, neighbor_segments(idx), pad, 2 * pad + h1 + h2,
+                     cw - pad, s2, t2)
 
         # annotation banner above the timeline (red if illogical sequence)
         if idx in events:

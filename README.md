@@ -23,9 +23,10 @@ Built entirely on **OpenCV** (plus NumPy, which OpenCV needs anyway) – no GUI 
 - **Interactive timeline** (progress bar at the bottom):
   - Click jumps to the position, click + drag scrubs through the video (pauses automatically)
   - Hovering shows the frame number and time under the mouse (and the event, if marked)
-  - **Yellow ticks** = annotated frames
-  - **Red ticks** = illogical sequence (two takeoffs or two landings directly in a row)
+  - **Tick color by event type**: Takeoff = light blue, Landing = magenta, LED on = yellow, LED off = orange
+  - **Red ticks** = illogical sequence (two takeoffs or two landings directly in a row); red overrides the type color
 - **Plausibility check**: takeoff and landing must strictly alternate — every jump is exactly one flight phase — violations are reported live in the console and shown in red in the timeline
+- **Previous and next mark at a glance**: the overlay shows the last mark before the current frame and the next one (with time distance), event names in their timeline color, so you always know whether a takeoff or a landing is due
 - **Jump between annotations**: `PageDown`/`.` and `PageUp`/`,` skip directly to the next/previous mark (handy for reviewing flags); playback pauses while jumping
 - **Automatic, atomic saving**: after every change the data is written to the events CSV (first `.tmp`, then `os.replace()`) – **no data loss on crash**, never half-finished CSV files
 - **Writes only on change**: the CSV is rewritten only when annotations actually changed; opening and closing a video without changes leaves all files untouched
@@ -80,7 +81,7 @@ Notes:
 | **Right arrow / `d`** | One frame forward |
 | **Left arrow / `a`** | One frame back |
 | **PageDown / `.`** | Jump to the next annotated frame |
-| **PageUp / `,`** | Jump to the previous annotated frame |
+| **PageUp / `,`** | Jump to the previous annotated frame (or to the start if there is none) |
 | **`o`** | Mark takeoff (feet leave the bed) |
 | **`l`** | Mark landing (feet touch the bed) |
 | **`t`** | Mark LED on |
@@ -94,7 +95,7 @@ Notes:
 
 The playback mode can also be selected with the **slider below the video** (trackbar): position 0 = real time, position 1–10 = skip. Every change is saved immediately. When quitting via the window's X button or `q`/`ESC`, a save that failed earlier (e.g. CSV locked in Excel) is retried once more; without changes nothing is written (`Finished. No changes, CSV not rewritten.`).
 
-`PageDown`/`.` and `PageUp`/`,` jump to the next/previous annotated frame (pausing playback). A jump to a direction without further marks prints a note and stays put. Shift/Ctrl + arrow combinations are **not** usable for this: OpenCV's `waitKeyEx` only reports the bare arrow key code on Windows and drops the modifier, so dedicated keys are used instead.
+`PageDown`/`.` and `PageUp`/`,` jump to the next/previous annotated frame (pausing playback). Without an earlier mark, `PageUp`/`,` jumps to the start of the video; without a later mark, `PageDown`/`.` prints a note and stays put. Shift/Ctrl + arrow combinations are **not** usable for this: OpenCV's `waitKeyEx` only reports the bare arrow key code on Windows and drops the modifier, so dedicated keys are used instead.
 
 ## Custom Flags (Free-Text Annotations)
 
