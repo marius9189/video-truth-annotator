@@ -114,8 +114,8 @@ WHITE = (255, 255, 255)
 BLACK = (0, 0, 0)
 ORANGE = (0, 120, 255)   # banner: marked frame
 DARK_RED = (0, 0, 170)   # banner: marked frame with illogical sequence
-BAR_BG = (60, 60, 60)
-BAR_FILL = (0, 170, 0)
+BAR_BG = (60, 60, 60)      # timeline: unplayed part (dark grey)
+BAR_FILL = (170, 170, 170)  # timeline: played part (light grey, distinct from tick colors)
 
 KEY_RIGHT = 2555904
 KEY_LEFT = 2424832
@@ -1003,7 +1003,7 @@ def main():
     invalid_cache = invalid_flight_frames(events)
     marks = sorted(events)
     events_version = 0
-    bar_cache = {"key": None, "grey": None, "green": None}
+    bar_cache = {"key": None, "grey": None, "fill": None}
 
     def on_mouse(event, x, y, flags, param):
         """Timeline: click/drag -> seek target, hover -> preview text."""
@@ -1105,17 +1105,17 @@ def main():
         key = (w, bar_h, events_version, frames_known)
         if bar_cache["key"] != key:
             grey = np.full((bar_h, w, 3), BAR_BG, np.uint8)
-            green = np.full((bar_h, w, 3), BAR_FILL, np.uint8)
+            fill = np.full((bar_h, w, 3), BAR_FILL, np.uint8)
             hw = max(1, int(round(2 * s)))
             scale = max(total_frames - 1, 1)
             for mi in (marks if frames_known else ()):
                 mx = int(round(min(mi / scale, 1.0) * (w - 1)))
                 color = (RED if mi in invalid_cache else
                          TICK_COLORS.get(events[mi][0], TICK_COLOR_OTHER))
-                for layer in (grey, green):
+                for layer in (grey, fill):
                     cv2.rectangle(layer, (mx - hw, 0), (mx + hw, bar_h), color, -1)
-            bar_cache.update(key=key, grey=grey, green=green)
-        return bar_cache["grey"], bar_cache["green"]
+            bar_cache.update(key=key, grey=grey, fill=fill)
+        return bar_cache["grey"], bar_cache["fill"]
 
     def render():
         """Compose the window image: frame, overlay, banner, timeline."""
@@ -1165,13 +1165,13 @@ def main():
                 put_text(canvas, fit_text(text, cw - 2 * pad, sc, th),
                          pad, y, sc, fg, th)
 
-        # timeline: cached layers, green up to the current position
-        grey, green = bar_layers(cw, bar_h, s)
+        # timeline: cached layers, fill up to the current position
+        grey, fill = bar_layers(cw, bar_h, s)
         bar = canvas[bar_y0:]
         if frames_known:
             scale = max(total_frames - 1, 1)
             pos_x = int(round(min(idx / scale, 1.0) * (cw - 1)))
-            bar[:, :pos_x] = green[:, :pos_x]
+            bar[:, :pos_x] = fill[:, :pos_x]
             bar[:, pos_x:] = grey[:, pos_x:]
             hw = max(1, int(round(2 * s)))
             cv2.rectangle(bar, (pos_x - hw, 0), (pos_x + hw, bar_h), WHITE, -1)
