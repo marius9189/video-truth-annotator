@@ -518,6 +518,72 @@ def find_free_events_path(video_path, out_dir=None):
     return events_path_for(video_path, counter, out_dir)
 
 
+def numbered_events_paths(video_path, out_dir=None):
+    """
+    Existing numbered CSVs for the video (video.video_truth.1.csv,
+    video.video_truth.2.csv, ...) in the output folder first (if given),
+    then next to the video. These are created after a metadata conflict and
+    should be resumed, not replaced.
+    """
+    seen = set()
+    for d in ([None] if out_dir is None else [out_dir, None]):
+        counter = 1
+        while True:
+            path = events_path_for(video_path, counter, d)
+            if not os.path.exists(path):
+                break
+            if path not in seen:
+                seen.add(path)
+                yield path
+            counter += 1
+
+
+def select_resume_source(video_path, out_dir, default_csv, fps, total_frames,
+                         fps_known, frames_known):
+    """
+    Pick the CSV to resume from and load it.
+
+    Tries every existing CSV for this video, best first (the output folder or
+    next to the video, numbered variants included, then a legacy
+    <video>_events.csv), and returns the first one that matches the video's
+    metadata. A numbered CSV written after an earlier conflict therefore
+    belongs to the video and is resumed instead of forking yet another file
+    on every start.
+
+    Returns (src_csv, events, metadata, error). src_csv is None when no CSV
+    exists; error is None for a readable file, else the reason it could not
+    be read. If no existing file matches, the first one is returned so the
+    caller can report the problem.
+    """
+    paths = [default_csv]
+    paths.extend(numbered_events_paths(video_path, out_dir))
+    if out_dir is not None:  # also look next to the video
+        paths.append(events_path_for(video_path))
+        paths.extend(numbered_events_paths(video_path))
+    paths.append(legacy_events_path_for(video_path))
+
+    existing = []
+    for p in paths:
+        if p not in existing and os.path.exists(p):
+            existing.append(p)
+    if not existing:
+        return None, {}, {}, None
+
+    first = None
+    for path in existing:
+        loaded, metadata, error = load_events(path, fps)
+        if first is None:
+            first = (path, loaded, metadata, error)
+        if error is None and not check_metadata_match(
+                metadata, video_path, fps, total_frames,
+                fps_known=fps_known, frames_known=frames_known):
+            if path != first[0]:
+                print(f"Note: '{first[0]}' does not match the video; "
+                      f"resuming '{path}' instead.")
+            return path, loaded, metadata, None
+    return first
+
+
 def save_events(video_path, events, fps, total_frames, quiet=False,
                 out_path=None, annotator=None):
     """
@@ -796,7 +862,8 @@ def main():
     total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
     frames_known = total_frames > 0  # marker for overlay display
     if not frames_known:
-        print("Warning: frame count unknown, timeline scaling may be inaccurate.")
+        print("Warning: frame count unknown, timeline disabled (frame "
+              "stepping and jumping still work).")
         total_frames = 1
 
     if args.check_seek:
@@ -811,19 +878,18 @@ def main():
     annotator = sanitize_meta(args.annotator) if args.annotator else None
 
     # source to resume from: the CSV in the output folder, else one next to
-    # the video (when --output-dir is used), else a legacy <video>_events.csv
-    # (fallbacks are read only; saves go to default_csv)
-    candidates = [default_csv]
-    if out_dir is not None:
-        candidates.append(events_path_for(video_path))
-    candidates.append(legacy_events_path_for(video_path))
-    src_csv = next((p for p in candidates if os.path.exists(p)), None)
+    # the video (when --output-dir is used), else a legacy <video>_events.csv.
+    # A numbered file from an earlier conflict is preferred over a mismatching
+    # one, so reopening does not create a new file every time.
+    src_csv, loaded, metadata, error = select_resume_source(
+        video_path, out_dir, default_csv, fps, total_frames,
+        fps_known, frames_known)
+
     if src_csv is not None and src_csv != default_csv:
         print(f"Note: found existing CSV '{src_csv}'; it is kept unchanged, "
               f"changes are saved to '{default_csv}'.")
 
     if src_csv is not None:
-        loaded, metadata, error = load_events(src_csv, fps)
         if error is not None:
             print(f"ERROR: existing CSV '{src_csv}' could not be read "
                   f"({error}). A new CSV will be written; the existing "
@@ -903,7 +969,7 @@ def main():
 
     seek_state = {"seek": -1, "scrubbing": False, "hover": -1,
                   "total": total_frames, "bar_y0": canvas_size[1],
-                  "width": canvas_size[0]}
+                  "width": canvas_size[0], "enabled": frames_known}
 
     # derived data, recomputed only when annotations change
     invalid_cache = invalid_flight_frames(events)
@@ -913,6 +979,8 @@ def main():
 
     def on_mouse(event, x, y, flags, param):
         """Timeline: click/drag -> seek target, hover -> preview text."""
+        if not param["enabled"]:
+            return  # frame count unknown: no meaningful timeline position
         w = param["width"]
         frac = min(max(x / max(w - 1, 1), 0.0), 1.0)
         target = int(round(frac * (param["total"] - 1)))
@@ -1006,13 +1074,13 @@ def main():
 
     def bar_layers(w, bar_h, s):
         """Timeline background/fill with ticks; rebuilt only on change."""
-        key = (w, bar_h, events_version)
+        key = (w, bar_h, events_version, frames_known)
         if bar_cache["key"] != key:
             grey = np.full((bar_h, w, 3), BAR_BG, np.uint8)
             green = np.full((bar_h, w, 3), BAR_FILL, np.uint8)
             hw = max(1, int(round(2 * s)))
             scale = max(total_frames - 1, 1)
-            for mi in marks:
+            for mi in (marks if frames_known else ()):
                 mx = int(round(min(mi / scale, 1.0) * (w - 1)))
                 color = (RED if mi in invalid_cache else
                          TICK_COLORS.get(events[mi][0], TICK_COLOR_OTHER))
@@ -1025,7 +1093,7 @@ def main():
         """Compose the window image: frame, overlay, banner, timeline."""
         cw, ch = canvas_size
         s = ui_scale(cw, ch)
-        bar_h = max(10, int(round(BAR_H * s)))
+        bar_h = min(max(10, int(round(BAR_H * s))), ch)
         bar_y0 = ch - bar_h
         seek_state["bar_y0"], seek_state["width"] = bar_y0, cw
         pad = int(round(10 * s))
@@ -1071,17 +1139,20 @@ def main():
 
         # timeline: cached layers, green up to the current position
         grey, green = bar_layers(cw, bar_h, s)
-        scale = max(total_frames - 1, 1)
-        pos_x = int(round(min(idx / scale, 1.0) * (cw - 1)))
         bar = canvas[bar_y0:]
-        bar[:, :pos_x] = green[:, :pos_x]
-        bar[:, pos_x:] = grey[:, pos_x:]
-        hw = max(1, int(round(2 * s)))
-        cv2.rectangle(bar, (pos_x - hw, 0), (pos_x + hw, bar_h), WHITE, -1)
+        if frames_known:
+            scale = max(total_frames - 1, 1)
+            pos_x = int(round(min(idx / scale, 1.0) * (cw - 1)))
+            bar[:, :pos_x] = green[:, :pos_x]
+            bar[:, pos_x:] = grey[:, pos_x:]
+            hw = max(1, int(round(2 * s)))
+            cv2.rectangle(bar, (pos_x - hw, 0), (pos_x + hw, bar_h), WHITE, -1)
+        else:
+            bar[:, :] = grey  # no frame count -> no meaningful position
 
         # hover: frame/time (and mark) under the mouse
         hover = seek_state["hover"]
-        if hover >= 0:
+        if frames_known and hover >= 0:
             hx = int(round(min(hover / scale, 1.0) * (cw - 1)))
             cv2.line(bar, (hx, 0), (hx, bar_h), (230, 230, 230), 1)
             tip = f"Frame {hover}  t = {fmt_time(hover / fps)} s"
@@ -1114,7 +1185,7 @@ def main():
         # draw at window resolution; skip redraw if nothing visible changed
         _, _, rw, rh = cv2.getWindowImageRect(WIN_NAME)
         if rw > 0 and rh > 0:
-            canvas_size = (max(rw, MIN_CANVAS_W), max(rh, MIN_CANVAS_H))
+            canvas_size = (rw, rh)
         render_key = (src.idx, events_version, paused, play_mode, skip_step,
                       canvas_size, seek_state["hover"])
         if render_key != last_render_key:
@@ -1231,6 +1302,7 @@ def main():
                            quiet=True, out_path=out_csv, annotator=annotator):
                 print("Saved manually.")
                 unsaved = False
+                changed = True  # the CSV was (re)written, so not "no changes"
 
         if not paused:
             if play_mode == MODE_SKIP:
