@@ -8,61 +8,69 @@ It marks events such as **takeoff** (athlete leaves the trampoline bed), **landi
 
 Developed for the [**OpenToF**](https://github.com/nrother/OpenToF/) project — an open source Time-of-Flight measurement system for trampolining — but fully usable as a standalone tool for any frame-accurate annotation task.
 
-Built entirely on **OpenCV** – no GUI frameworks, no other dependencies.
+Built entirely on **OpenCV** (plus NumPy, which OpenCV needs anyway) – no GUI frameworks.
 
 ## Features
 
 - **Frame-accurate annotation**: every video frame can be addressed individually (arrow keys), regardless of the playback mode
 - **Four event types**: Takeoff (`o`), Landing (`l`), LED on (`t`), LED off (`f`)
 - **Custom free-text flag per annotation** (`c`): attach any note to a mark — e.g. which sensor recorded it or a remark about an uncertain landing. Previously used flags are remembered across runs and offered as **autocomplete** while typing; stored as an extra CSV column (`Flag`)
-- **Resume existing annotations**: an already existing `<video>_events.csv` is loaded at startup and annotation continues seamlessly — nothing is ever lost by re-opening a video
+- **Resume existing annotations**: an already existing `<video>.video_truth.csv` is loaded at startup and annotation continues seamlessly — nothing is ever lost by re-opening a video
 - **Metadata check before loading**: the CSV metadata (video file, FPS, total frames) is validated against the video; on a mismatch the existing CSV is never touched
 - **Two playback modes**:
-  - **ECHTZEIT** ("real time") – playback is never slower than real time; if decoding falls behind, the player automatically jumps to the target frame (no cumulative drift)
-  - **SKIP n** – every n-th frame is displayed (1–10× playback speed) for quickly reviewing long recording sessions
+  - **REALTIME** – playback is never slower than real time; if decoding falls behind, frames are skipped (decoded without display for small gaps, a seek for large ones) — no cumulative drift
+  - **SKIP n** – every n-th frame is displayed at n-fold speed (1–10×) for quickly reviewing long recording sessions; the frames in between are only decoded, not converted
 - **Interactive timeline** (progress bar at the bottom):
   - Click jumps to the position, click + drag scrubs through the video (pauses automatically)
-  - **Yellow ticks** = annotated frames
-  - **Red ticks** = illogical sequence (two takeoffs or two landings directly in a row)
+  - Hovering shows the frame number and time under the mouse (and the event, if marked)
+  - **Tick color by event type**: Takeoff = light blue, Landing = magenta, LED on = yellow, LED off = orange
+  - **Red ticks** = illogical sequence (two takeoffs or two landings directly in a row); red overrides the type color
 - **Plausibility check**: takeoff and landing must strictly alternate — every jump is exactly one flight phase — violations are reported live in the console and shown in red in the timeline
+- **Previous and next mark at a glance**: the overlay shows the last mark before the current frame and the next one (with time distance), event names in their timeline color, so you always know whether a takeoff or a landing is due
 - **Jump between annotations**: `PageDown`/`.` and `PageUp`/`,` skip directly to the next/previous mark (handy for reviewing flags); playback pauses while jumping
 - **Automatic, atomic saving**: after every change the data is written to the events CSV (first `.tmp`, then `os.replace()`) – **no data loss on crash**, never half-finished CSV files
 - **Writes only on change**: the CSV is rewritten only when annotations actually changed; opening and closing a video without changes leaves all files untouched
 - **Freely resizable window** (`WINDOW_NORMAL`); 4K videos are scaled down to max. 1280×720 at startup (aspect ratio is preserved)
+- **Fast with large videos**: the frame is scaled to the window size before the overlay is drawn, so the overlay looks the same for every video resolution; recently shown frames are cached, so stepping backwards is instant; the window is only redrawn when something visible changes
+- **Output folder** (`--output-dir`) and **annotator name** (`--annotator`) in the CSV header
 - **Caps Lock friendly**: letter keys work regardless of Caps Lock state (uppercase input is normalised)
 
 ## Installation
 
-Only Python 3 with OpenCV is required:
-
-```bash
-pip install opencv-python
-```
+The script declares its dependencies inline (PEP 723), so [uv](https://docs.astral.sh/uv/) installs OpenCV automatically on the first run, with no manual setup needed. On Linux/macOS the script can also be run directly (`./video_truth_annotator.py`) after making it executable (`chmod +x`).
 
 ## Usage
 
 ```bash
-python video_truth_annotator.py <path/to/video.mp4>
-python video_truth_annotator.py --help      # usage and options (-h works too)
-python video_truth_annotator.py --controls  # key controls
+uv run video_truth_annotator.py <path/to/video.mp4>
+uv run video_truth_annotator.py <video> -o <folder>        # CSV into <folder> instead of next to the video
+uv run video_truth_annotator.py <video> --annotator "Name" # annotator in the CSV header
+uv run video_truth_annotator.py <video> --check-seek       # test whether seeking is frame-accurate
+uv run video_truth_annotator.py --help      # usage and options (-h works too)
+uv run video_truth_annotator.py --controls  # key controls
 ```
 
-Without an argument the usage is printed to the console. If the video has no frame rate, 30 fps is assumed (console warning).
+Without an argument the usage is printed to the console. The key controls are printed to the console on every start of the player.
+
+- `-o/--output-dir DIR`: the CSV is written to `DIR` (created if missing) instead of next to the video. To resume, the tool looks in `DIR` first, then next to the video, then for a legacy file; files found outside `DIR` are only read.
+- `--annotator NAME`: written as `# Annotator: NAME` into the CSV header. Without it, the annotator of an existing CSV is kept.
+- `--check-seek`: decodes the first 1500 frames sequentially and compares them with seeked frames. With some files (variable frame rate, unusual GOP structure) OpenCV/FFmpeg seeks land on the wrong frame; then step-back, jumps and timeline clicks could show a different frame than the displayed number. Exit code 2 if a mismatch is found. If the video has no frame rate, 30 fps is assumed (console warning).
 
 For flight-time validation, a high frame rate matters: record at the highest rate your camera supports (e.g. 240 fps) so that the frame quantisation error of the takeoff/landing timestamps stays well below the tolerance you want to validate against.
 
 ## Resuming Annotations & Metadata Check
 
-When you open a video that already has an `<video>_events.csv` next to it, the tool behaves as follows:
+When you open a video that already has an `<video>.video_truth.csv` (next to it, or in the `--output-dir`), the tool behaves as follows:
 
 1. **Metadata match** (video file, FPS, total frames) → the existing annotations are loaded and annotation continues where you left off (`Loaded: … events, annotation continues`).
-2. **Metadata mismatch** (e.g. the CSV belongs to a different video, a re-encoded version, or a different frame rate) → an error message with the differing fields is printed to the console. The existing CSV is **never overwritten**; instead a new CSV with a suffix is written (`video_events_1.csv`, `video_events_2.csv`, …). Autosave, manual save and the final save on exit all target that same new file, so the original stays untouched.
+2. **Metadata mismatch** (e.g. the CSV belongs to a different video, a re-encoded version, or a different frame rate) → an error message with the differing fields is printed to the console. The existing CSV is **never overwritten**; instead a new CSV with a suffix is written (`video.video_truth.1.csv`, `video.video_truth.2.csv`, …). Autosave, manual save and the final save on exit all target that same new file, so the original stays untouched.
 3. **Unreadable CSV** (corrupt file/encoding) → same behaviour as a mismatch: error message, old file kept, new suffixed CSV.
 
 Notes:
 
 - Fields the video itself does not report (unknown frame rate or frame count) are skipped in the check — a comparison against the fallback value (30 fps) would produce false conflicts.
 - An **empty CSV** (valid metadata, no events yet) is loaded normally.
+- **Legacy files**: older versions wrote `<video>_events.csv`. If no `<video>.video_truth.csv` exists, the legacy file is loaded instead (same checks as above); it is left unchanged and all saves go to `<video>.video_truth.csv`.
 - Negative frame indices in the CSV are rejected with a console warning; the timestamp column is checked against `frame / fps` (tolerance 1 ms) — the **frame index is the source of truth**, a mismatching timestamp is only reported, not fatal.
 
 ## Keyboard Controls
@@ -73,7 +81,7 @@ Notes:
 | **Right arrow / `d`** | One frame forward |
 | **Left arrow / `a`** | One frame back |
 | **PageDown / `.`** | Jump to the next annotated frame |
-| **PageUp / `,`** | Jump to the previous annotated frame |
+| **PageUp / `,`** | Jump to the previous annotated frame (or to the start if there is none) |
 | **`o`** | Mark takeoff (feet leave the bed) |
 | **`l`** | Mark landing (feet touch the bed) |
 | **`t`** | Mark LED on |
@@ -81,13 +89,13 @@ Notes:
 | **`c`** | Set/change the free-text flag of the current mark |
 | **`u`** | Delete the annotation — event **and** flag — of the current frame |
 | **`s`** | Manually save the CSV (with status output) |
-| **`m`** | Toggle playback mode (ECHTZEIT ↔ SKIP) |
+| **`m`** | Toggle playback mode (REALTIME ↔ SKIP) |
 | **`1`–`9`, `0`** | Show every n-th frame (1–10), switches to SKIP |
 | **`q` / `ESC`** | Quit (saves automatically) |
 
-The playback mode can also be selected with the **slider below the video** (trackbar): position 0 = real time, position 1–10 = skip. When quitting via the window's X button or `q`/`ESC`, the data is saved one final time — but **only if annotations actually changed** during the session (`Finished. No changes, CSV not rewritten.` otherwise).
+The playback mode can also be selected with the **slider below the video** (trackbar): position 0 = real time, position 1–10 = skip. Every change is saved immediately. When quitting via the window's X button or `q`/`ESC`, a save that failed earlier (e.g. CSV locked in Excel) is retried once more; without changes nothing is written (`Finished. No changes, CSV not rewritten.`).
 
-`PageDown`/`.` and `PageUp`/`,` jump to the next/previous annotated frame (pausing playback). A jump to a direction without further marks prints a note and stays put. Shift/Ctrl + arrow combinations are **not** usable for this: OpenCV's `waitKeyEx` only reports the bare arrow key code on Windows and drops the modifier, so dedicated keys are used instead.
+`PageDown`/`.` and `PageUp`/`,` jump to the next/previous annotated frame (pausing playback). Without an earlier mark, `PageUp`/`,` jumps to the start of the video; without a later mark, `PageDown`/`.` prints a note and stays put. Shift/Ctrl + arrow combinations are **not** usable for this: OpenCV's `waitKeyEx` only reports the bare arrow key code on Windows and drops the modifier, so dedicated keys are used instead.
 
 ## Custom Flags (Free-Text Annotations)
 
@@ -103,7 +111,7 @@ Every mark (takeoff, landing, LED on/off) can carry an **optional free-text flag
 
 ## CSV Output
 
-The annotations are written to `<video>_events.csv` (semicolon-separated) next to the video:
+The annotations are written to `<video>.video_truth.csv` (semicolon-separated) next to the video, or into the `--output-dir` folder:
 
 ```csv
 # Video: meinvideo.mp4
@@ -111,6 +119,7 @@ The annotations are written to `<video>_events.csv` (semicolon-separated) next t
 # Frame-Dauer: 33.333 ms        (frame duration)
 # Gesamtframes: 900             (total frames)
 # Video-Dauer: 30.000 s         (video duration)
+# Annotator: Jane Doe           (only with --annotator)
 # Erstellt: 2026-09-25T17:52:34 (created)
 Frame;Timestamp;Event;Flag
 0;0,000;LED on;Sensor 2
@@ -125,14 +134,14 @@ Frame;Timestamp;Event;Flag
 - Timestamps are in seconds with a **German decimal separator (comma)**, matching the format of the truth CSVs
 - Every timestamp is exactly reproducible: `timestamp = frame / fps`
 - Flight time per jump is simply the difference between a landing and the preceding takeoff
-- If the file is locked while saving (e.g. opened in Excel), a rescue copy is kept in `<video>_events.csv.tmp`
+- If the file is locked while saving (e.g. opened in Excel), a rescue copy is kept in `<video>.video_truth.csv.tmp`
 
 Load the annotations in Python:
 
 ```python
 import pandas as pd
 
-df = pd.read_csv("meinvideo_events.csv", sep=";", comment="#")
+df = pd.read_csv("meinvideo.video_truth.csv", sep=";", comment="#")
 ```
 
 ## Plausibility Check (Takeoff/Landing)
@@ -141,55 +150,35 @@ Takeoff and landing must **strictly alternate** — each jump consists of exactl
 
 ## Notes
 
-- Closing the window (X button) exits the program cleanly and performs a final save if there were changes – even with an empty annotation list
+- Closing the window (X button) exits the program cleanly, like `q`/`ESC`
 - If the total frame count of the video is unknown, the program warns; the timeline scaling may then be inaccurate
 - At the end of the video, playback pauses automatically and jumps back to the start
-- Text overlays use OpenCV's built-in fonts, so German UI strings are written without umlauts
+- Text overlays use OpenCV's built-in fonts, which cannot draw umlauts or other non-ASCII characters
 
 ## Troubleshooting
 
 | Problem | Solution |
 |---|---|
-| Command runs without any output, no window opens | The script file is incomplete — it must end with `if __name__ == "__main__": main()` (re-copy the full file) |
 | `Warning: unknown frame rate, assuming 30 fps` | The container reports no frame rate; the tool assumes 30 fps — convert the video (e.g. `ffmpeg -i in.mp4 -vf fps=240 -crf 18 out.mp4`) for exact timestamps |
 | Variable frame rate (VFR) footage | Many smartphones record VFR; the tool assumes a constant rate. Convert with FFmpeg first (see above) |
-| `WARNING: '…' is locked (opened in Excel?)` | Close the CSV in Excel; a rescue copy is kept in `<video>_events.csv.tmp` |
-| `ERROR: metadata of CSV … does not match the video` | The existing CSV was written for a different video/version — a new `_1` CSV is created automatically; sort out the old file manually if needed |
+| `WARNING: '…' is locked (opened in Excel?)` | Close the CSV in Excel; a rescue copy is kept in `<video>.video_truth.csv.tmp` |
+| `WARNING: could not write …` | The folder is read-only or the disk is full; the tool keeps running but changes are not saved. Fix the cause, then press `s` or quit (a failed save is retried on exit) |
+| `ERROR: metadata of CSV … does not match the video` | The existing CSV was written for a different video/version — a new `.video_truth.1.csv` is created automatically; sort out the old file manually if needed |
+| Frame number seems off after a jump/step back | Run `--check-seek`; if it reports mismatches, re-encode with FFmpeg (e.g. `ffmpeg -i in.mp4 -vf fps=240 -g 1 -crf 18 out.mp4`) |
 | Arrow keys do nothing | Use the alternative keys `a` / `d` |
 
-## German Terms Used in the Code
+## German Terms
 
-The code and its user interface are written in German. The following translations apply:
+The code and user interface are in English. A few German terms remain on purpose:
 
-| German term (in code / UI) | English meaning |
-|---|---|
-| ECHTZEIT | Real time (playback mode) |
-| SKIP n / jeder n-te Frame | Skip / show every n-th frame |
-| Wiedergabemodus | Playback mode |
-| Fortschrittsleiste / Timeline | Progress bar / timeline |
-| Pfeil rechts / Pfeil links | Right arrow / left arrow |
-| Leertaste | Space bar |
-| Ein Frame vor / zurück | One frame forward / back |
-| Markieren / Markierung | Mark / annotation |
-| Löschen | Delete |
-| Speichern / Gespeichert | Save / saved |
-| Manuell gespeichert | Manually saved |
-| Beenden | Quit / exit |
-| Warnung | Warning |
-| Unlogische Sequenz | Illogical sequence |
-| zwei Takeoffs oder zwei Landungen hintereinander | two takeoffs or two landings in a row |
-| Fenster geschlossen | Window closed |
-| Kein Frame mehr lesbar, beende | No more frames readable, quitting |
-| Erstellt | Created |
-| Video-Dauer | Video duration |
-| Gesamtframes | Total frames |
-| Frame-Dauer | Frame duration |
-| Rettungskopie | Rescue copy |
-| Überschrieben | Overwritten |
-| Verwendung | Usage |
-| Warnung: unbekannte Framerate, nehme 30 fps an | Warning: unknown frame rate, assuming 30 fps |
-| zwischengespeichert | auto-saved (intermediate save) |
-| Frame-Anzahl unbekannt, Timeline-Skalierung ggf. ungenau | Frame count unknown, timeline scaling may be inaccurate |
+| German term | English meaning | Where |
+|---|---|---|
+| Frame-Dauer | Frame duration | CSV metadata line |
+| Gesamtframes | Total frames | CSV metadata line |
+| Video-Dauer | Video duration | CSV metadata line |
+| Erstellt | Created | CSV metadata line |
+
+The CSV metadata keys stay German so the format remains compatible with existing truth CSVs.
 
 ## Related Project
 

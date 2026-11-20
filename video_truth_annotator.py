@@ -1,4 +1,11 @@
-#!/usr/bin/env python3
+#!/usr/bin/env -S uv run --script
+# /// script
+# requires-python = ">=3.9"
+# dependencies = [
+#     "opencv-python>=4.5",
+#     "numpy",
+# ]
+# ///
 """
 Video player for evaluating video ground-truth data.
 
@@ -7,41 +14,37 @@ Every event can carry an optional free-text flag (key c), e.g. the sensor
 name or a note about uncertainty; used flags are proposed as autocomplete
 and remembered across runs in a flags file next to the script.
 
-New compared to the original version:
-  - Custom free-text flag per annotation (key c) with autocomplete over a
-    persistent history of previously used flags; stored as a 4th CSV
-    column (Flag). Older 3-column CSVs without a flag remain readable.
-  - At startup, an already existing <video>_events.csv is read in
-    and annotation is continued (no more overwriting with an empty file).
-  - Before loading, the CSV metadata is checked against the video
-    (FPS, total frames, video file). If they do not match, an error
-    message is printed to the console, the old CSV is left untouched
-    and a new CSV with a suffix is written instead (video_events_1.csv,
-    video_events_2.csv, ...). Fields that the video itself does not
-    report (unknown frame rate / frame count) are skipped in the check,
-    because a comparison against a fallback value would produce false
-    conflicts.
-  - The CSV is only rewritten when annotations actually changed
-    (dirty flag); opening and closing without changes no longer
-    produces new suffixed files or touches the existing one.
+Output: <video>.video_truth.csv next to the video (or in the folder given
+with --output-dir). An existing file is loaded at startup and annotation
+continues; a legacy <video>_events.csv next to the video is loaded as a
+fallback (and from then on saved under the new name).
+The CSV metadata (video file, FPS, total frames) is checked first; on a
+mismatch the old CSV is left untouched and a numbered CSV is written
+instead (video.video_truth.1.csv, video.video_truth.2.csv, ...). Fields
+the video itself does not report are skipped in the check.
+--annotator NAME stores the annotator's name in the CSV header.
 
 Key controls: printed with --controls.
 
 Playback mode (also selectable via the slider below the video):
-  ECHTZEIT : target time of each frame from an absolute time counter; if
-             decoding cannot keep up, frames are skipped
-             (jump to the target frame), playback never slower than real time.
-  SKIP n   : every n-th frame is shown, each shown frame stays on screen
-             for one normal frame duration -> n-fold playback speed.
+  REALTIME : target time of each frame from an absolute time counter; if
+             decoding cannot keep up, frames are skipped (decoded without
+             display, or a seek for large gaps), never slower than real time.
+  SKIP n   : every n-th frame is shown at n-fold playback speed, clocked
+             against an absolute time counter as well.
 
 Timeline:
   Clicking the bar at the bottom jumps to that position, click + drag scrubs
-  through the video (pauses automatically). Yellow ticks = annotated frames,
-  RED ticks = illogical sequence (two takeoffs or two landings directly in a
-  row, without the respective counterpart in between).
+  through the video (pauses automatically). Hovering shows the frame and time
+  under the mouse. Tick color by event type (Takeoff light blue, Landing
+  magenta, LED on yellow, LED off orange), RED ticks = illogical sequence (two takeoffs or two landings directly in a row, without the
+  respective counterpart in between).
 
 Window freely resizable (WINDOW_NORMAL); 4K videos are scaled down to a
-maximum of 1280x720 at startup, aspect ratio is preserved.
+maximum of 1280x720 at startup, aspect ratio is preserved. The frame is
+scaled to the window before the overlay is drawn, so the overlay has the
+same size for every video resolution, and recently shown frames are cached
+so stepping backwards does not need a seek.
 For frame-by-frame annotation the playback mode is irrelevant:
 all frames remain individually addressable (arrow keys). Letter keys also
 work with Caps Lock enabled (uppercase input is normalised to lowercase).
@@ -54,29 +57,72 @@ Note: the CSV metadata comment lines are deliberately kept in German
 existing truth CSVs and earlier files written by this tool.
 """
 
+import argparse
+import hashlib
 import os
 import sys
 import time
-import cv2
+from bisect import bisect_left, bisect_right
+from collections import OrderedDict
 from datetime import datetime
+
+import cv2
+import numpy as np
 
 WIN_NAME = ("Video Truth Player - Space: Play/Pause, Arrows: Frame, "
             "o/l: Takeoff/Landing, t/f: LED on/off, c: Flag, u: Delete, "
             ",/.: Prev/Next mark, s: Save, q: Quit")
 TRACKBAR_NAME = "Playback mode (0=real time, 1-10=skip)"
 
-BAR_H = 28          # height of the progress bar at the bottom
-OVERLAY_H = 90      # height of the info overlay at the top
 MAX_START_W = 1280  # start window: max. width
 MAX_START_H = 720   # start window: max. height
+
+# UI sizes below are in window pixels for a 1280x720 window and scale with
+# the window size (clamped), independent of the video resolution.
+REF_W, REF_H = 1280, 720
+UI_SCALE_MIN, UI_SCALE_MAX = 0.5, 2.0
+MIN_CANVAS_W, MIN_CANVAS_H = 160, 120
+BAR_H = 26          # height of the timeline at the bottom
+FONT = cv2.FONT_HERSHEY_SIMPLEX
+
+VIEW_CACHE_BYTES = 256 * 1024 * 1024  # budget for cached, window-sized frames
+MIN_VIEW_CACHE_FRAMES = 8
+SKIP_RESYNC_S = 0.25  # SKIP: reset the clock if playback lags more than this
+PAUSED_POLL_MS = 30   # key/mouse polling interval while paused
+
+CHECK_SEEK_FRAMES = 1500  # --check-seek: frames decoded sequentially
+CHECK_SEEK_SAMPLES = 6    # --check-seek: number of seek targets
 
 MODE_REALTIME = "realtime"  # real-time playback (auto-skip when lagging)
 MODE_SKIP = "skip"          # every n-th frame, n-fold speed
 
 FLIGHT_EVENTS = ("Takeoff", "Landing")  # must strictly alternate
 
-YELLOW = (0, 255, 255)  # timeline: valid annotation
-RED = (0, 0, 255)       # timeline: illogical sequence
+YELLOW = (0, 255, 255)
+RED = (0, 0, 255)        # timeline: illogical sequence (overrides type color)
+# timeline tick color per event type (BGR); unknown names from a CSV: grey
+TICK_COLORS = {
+    "Takeoff": (255, 170, 0),   # light blue
+    "Landing": (255, 0, 255),   # magenta
+    "LED on": (0, 255, 255),    # yellow
+    "LED off": (0, 140, 255),   # orange
+}
+TICK_COLOR_OTHER = (200, 200, 200)
+GREEN = (0, 220, 0)
+CYAN = (255, 255, 0)
+WHITE = (255, 255, 255)
+BLACK = (0, 0, 0)
+ORANGE = (0, 120, 255)   # banner: marked frame
+DARK_RED = (0, 0, 170)   # banner: marked frame with illogical sequence
+BAR_BG = (60, 60, 60)
+BAR_FILL = (0, 170, 0)
+
+KEY_RIGHT = 2555904
+KEY_LEFT = 2424832
+KEY_UP = 2490368
+KEY_DOWN = 2621440
+KEY_PAGE_UP = 2162688
+KEY_PAGE_DOWN = 2228224
 
 CSV_SEP = ";"
 COMMENT_PREFIX = "#"
@@ -89,14 +135,15 @@ FLAG_HISTORY_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)),
 FLAG_HISTORY_MAX = 200   # keep at most this many entries
 FLAG_SUGGESTIONS = 6     # suggestions shown while typing a flag
 
-USAGE = "Usage: python video_truth_annotator.py <video/path>"
+CSV_SUFFIX = ".video_truth"     # output: <video>.video_truth.csv
+LEGACY_CSV_SUFFIX = "_events"   # older versions wrote <video>_events.csv
 
 CONTROLS = """Controls:
   Space            : Play / Pause
   Right arrow / d  : one frame forward
   Left arrow  / a  : one frame back
   PageDown / .     : jump to next annotation
-  PageUp   / ,     : jump to previous annotation
+  PageUp   / ,     : jump to previous annotation (or to the start)
   o                : mark Takeoff
   l                : mark Landing
   t                : mark LED on
@@ -106,9 +153,10 @@ CONTROLS = """Controls:
                      Up/Down/Tab=pick a suggestion
   u                : delete the annotation (with flag) of the current frame
   s                : save CSV manually (with status output)
-  m                : toggle playback mode (ECHTZEIT <-> SKIP)
+  m                : toggle playback mode (REALTIME <-> SKIP)
   1 to 9, 0        : show every n-th frame (1-10), switch to SKIP
-  q / ESC          : quit"""
+  q / ESC          : quit
+Mouse: click/drag the timeline to jump/scrub, hover it to see frame and time."""
 
 
 def normalize_key(key):
@@ -127,6 +175,82 @@ def sanitize_flag(text):
     """Strip characters that would break the semicolon CSV line format."""
     return text.replace(CSV_SEP, ",").replace("\n", " ").replace("\r", " ").strip()
 
+
+def sanitize_meta(text):
+    """Metadata values must stay on one comment line."""
+    return text.replace("\n", " ").replace("\r", " ").strip()
+
+
+# --- Drawing helpers ---------------------------------------------------------
+
+def ui_scale(cw, ch):
+    """UI scale factor for a canvas of cw x ch window pixels."""
+    return min(max(min(cw / REF_W, ch / REF_H), UI_SCALE_MIN), UI_SCALE_MAX)
+
+
+def thick(s, base=2):
+    return max(1, int(round(base * s)))
+
+
+def text_height(scale, thickness):
+    (_, th), baseline = cv2.getTextSize("Ag", FONT, scale, thickness)
+    return th + baseline
+
+
+def text_width(text, scale, thickness):
+    return cv2.getTextSize(text, FONT, scale, thickness)[0][0]
+
+
+def fit_text(text, max_w, scale, thickness, keep_end=False):
+    """Shorten `text` with '...' so it fits into max_w pixels."""
+    if text_width(text, scale, thickness) <= max_w:
+        return text
+    ell = "..."
+    lo, hi = 0, len(text)  # binary search: longest slice that still fits
+    while lo < hi:
+        mid = (lo + hi + 1) // 2
+        cand = ell + text[-mid:] if keep_end else text[:mid] + ell
+        if text_width(cand, scale, thickness) <= max_w:
+            lo = mid
+        else:
+            hi = mid - 1
+    if lo == 0:
+        return ""
+    return ell + text[-lo:] if keep_end else text[:lo] + ell
+
+
+def put_text(img, text, x, y, scale, color, thickness):
+    cv2.putText(img, text, (x, y), FONT, scale, color, thickness, cv2.LINE_AA)
+
+
+def put_segments(img, segments, x, y, max_x, scale, thickness):
+    """Draw (text, color) segments in one line; truncate at max_x."""
+    for text, color in segments:
+        fitted = fit_text(text, max_x - x, scale, thickness)
+        if not fitted:
+            break
+        put_text(img, fitted, x, y, scale, color, thickness)
+        if fitted != text:
+            break
+        x += text_width(text, scale, thickness)
+
+
+def darken(img, y0, y1, alpha=0.35):
+    """Darken the rows y0..y1 (semi-transparent overlay background)."""
+    roi = img[max(0, y0):max(0, y1)]
+    if roi.size:
+        img[max(0, y0):max(0, y1)] = cv2.convertScaleAbs(roi, alpha=alpha)
+
+
+def fit_rect(frame_w, frame_h, area_w, area_h):
+    """Size and offset of the frame fitted into the area (aspect preserved)."""
+    s = min(area_w / frame_w, area_h / frame_h)
+    vw = max(1, int(round(frame_w * s)))
+    vh = max(1, int(round(frame_h * s)))
+    return vw, vh, (area_w - vw) // 2, (area_h - vh) // 2
+
+
+# --- Flag history and editor -------------------------------------------------
 
 def load_flag_history(path):
     """Read the flag history (one flag per line); [] if missing/unreadable."""
@@ -163,40 +287,61 @@ def autocomplete(text, history, limit=FLAG_SUGGESTIONS):
     return [flag for flag in history if needle in flag.lower()][:limit]
 
 
-def edit_flag_text(base_display, event_name, initial, history):
+def edit_flag_text(base_display, event_name, initial, history, bar_h):
     """
     In-window text editor for the free-text flag, with autocomplete over the
     flag history. Returns (text, committed); committed=False means aborted
     (Esc). Enter commits the typed text; an empty text removes the flag.
     Keys: printable ASCII appends, Backspace deletes, Tab completes/cycles.
+    The panel is only redrawn after a key press.
     """
     text = initial
     prefix = initial   # text as typed; suggestions filter on this, so Tab
     pick = -1          # or the arrow keys can cycle through suggestions
+    h, w = base_display.shape[:2]
+    s = ui_scale(w, h)
+    pad = int(round(12 * s))
+    title_sc, input_sc, sugg_sc = 0.6 * s, 0.9 * s, 0.55 * s
+    title_t, input_t, sugg_t = thick(s), thick(s), thick(s)
+    title_h = text_height(title_sc, title_t)
+    input_h = text_height(input_sc, input_t)
+    sugg_h = text_height(sugg_sc, sugg_t) + int(round(4 * s))
+    panel_h = pad + title_h + pad + input_h + pad + FLAG_SUGGESTIONS * sugg_h + pad
+    y1 = h - bar_h
+    y0 = max(0, y1 - panel_h)
+    dirty = True
     while True:
         # window closed via X button -> abort the edit; the main loop then
         # exits cleanly (with save)
         if cv2.getWindowProperty(WIN_NAME, cv2.WND_PROP_VISIBLE) < 1:
             return initial, False
-        display = base_display.copy()
-        h, w = display.shape[:2]
-        y0 = max(0, h - BAR_H - 230)
-        cv2.rectangle(display, (0, y0), (w, h - BAR_H), (30, 30, 140), -1)
-        cv2.putText(display, f"Flag for '{event_name}'  "
-                             f"(Enter=ok, Esc=cancel, Up/Down=select)",
-                    (10, y0 + 30), cv2.FONT_HERSHEY_SIMPLEX, 0.9,
-                    (255, 255, 255), 2, cv2.LINE_AA)
-        cv2.putText(display, text + "_", (20, y0 + 72),
-                    cv2.FONT_HERSHEY_SIMPLEX, 1.2, (0, 255, 255), 3, cv2.LINE_AA)
         matches = autocomplete(prefix, history)
-        for i, candidate in enumerate(matches):
-            selected = (i == pick)
-            color = (0, 255, 255) if selected else (200, 200, 200)
-            cv2.putText(display, ("> " if selected else "  ") + candidate,
-                        (24, y0 + 104 + i * 22), cv2.FONT_HERSHEY_SIMPLEX,
-                        0.65, color, 2, cv2.LINE_AA)
-        cv2.imshow(WIN_NAME, display)
-        key = cv2.waitKeyEx(30) & 0xFFFFFFFF
+        if dirty:
+            display = base_display.copy()
+            cv2.rectangle(display, (0, y0), (w, y1), (30, 30, 140), -1)
+            y = y0 + pad + title_h
+            put_text(display, fit_text(f"Flag for '{event_name}'  (Enter=ok, "
+                                       f"Esc=cancel, Up/Down/Tab=select)",
+                                       w - 2 * pad, title_sc, title_t),
+                     pad, y, title_sc, WHITE, title_t)
+            y += pad + input_h
+            put_text(display, fit_text(text + "_", w - 2 * pad, input_sc,
+                                       input_t, keep_end=True),
+                     pad, y, input_sc, YELLOW, input_t)
+            y += pad
+            for i, candidate in enumerate(matches):
+                y += sugg_h
+                selected = (i == pick)
+                put_text(display, fit_text(("> " if selected else "  ") + candidate,
+                                           w - 2 * pad, sugg_sc, sugg_t),
+                         pad, y, sugg_sc,
+                         YELLOW if selected else (200, 200, 200), sugg_t)
+            cv2.imshow(WIN_NAME, display)
+            dirty = False
+        key = cv2.waitKeyEx(PAUSED_POLL_MS) & 0xFFFFFFFF
+        if key == 0xFFFFFFFF:
+            continue                   # no key pressed
+        dirty = True
         if key in (13, 10):            # Enter -> commit
             return text, True
         if key == 27:                  # Esc -> abort
@@ -205,11 +350,11 @@ def edit_flag_text(base_display, event_name, initial, history):
             text = text[:-1]
             prefix = text
             pick = -1
-        elif key == 2621440:           # Down -> next suggestion into the input
+        elif key == KEY_DOWN:          # next suggestion into the input
             if matches:
                 pick = 0 if pick < 0 else (pick + 1) % len(matches)
                 text = matches[pick]
-        elif key == 2490368:           # Up -> previous suggestion
+        elif key == KEY_UP:            # previous suggestion
             if matches:
                 pick = len(matches) - 1 if pick < 0 else (pick - 1) % len(matches)
                 text = matches[pick]
@@ -223,10 +368,25 @@ def edit_flag_text(base_display, event_name, initial, history):
             pick = -1
 
 
-def events_path_for(video_path):
-    """Path of the events CSV belonging to the video (without suffix)."""
+# --- CSV ---------------------------------------------------------------------
+
+def events_path_for(video_path, counter=0, out_dir=None):
+    """
+    Path of the events CSV belonging to the video: video.video_truth.csv,
+    or video.video_truth.<counter>.csv for counter > 0. The CSV lies in
+    out_dir if given, else next to the video.
+    """
     base, _ = os.path.splitext(video_path)
-    return base + "_events.csv"
+    if out_dir is not None:
+        base = os.path.join(out_dir, os.path.basename(base))
+    suffix = f"{CSV_SUFFIX}.{counter}" if counter else CSV_SUFFIX
+    return base + suffix + ".csv"
+
+
+def legacy_events_path_for(video_path):
+    """Path of the CSV written by older versions (video_events.csv)."""
+    base, _ = os.path.splitext(video_path)
+    return base + LEGACY_CSV_SUFFIX + ".csv"
 
 
 def load_events(csv_path, fps):
@@ -235,7 +395,8 @@ def load_events(csv_path, fps):
 
     Returns: (events_dict, metadata_dict, error)
       events_dict  : {frame_index: (event_name, flag)}
-      metadata_dict: {"video": ..., "fps": ..., "gesamtframes": ...} or {}
+      metadata_dict: {"video": ..., "fps": ..., "gesamtframes": ...,
+                      "annotator": ... (optional)} or {}
       error        : None or description of why the file was not readable
 
     Data validation:
@@ -311,6 +472,7 @@ def check_metadata_match(metadata, video_path, fps, total_frames,
     count) are skipped: comparing them against the fallback value
     (30 fps / 1) would produce a false conflict, although the CSV is
     obviously the correct one for this video.
+    The annotator is not checked (it is not a property of the video).
     """
     errors = []
     video_name = os.path.basename(video_path)
@@ -345,75 +507,222 @@ def check_metadata_match(metadata, video_path, fps, total_frames,
     return errors
 
 
-def find_free_events_path(video_path):
+def find_free_events_path(video_path, out_dir=None):
     """
-    Find the next free CSV path: video_events.csv,
-    then video_events_1.csv, video_events_2.csv, ...
+    Find the next free CSV path: video.video_truth.csv,
+    then video.video_truth.1.csv, video.video_truth.2.csv, ...
     """
-    base, _ = os.path.splitext(video_path)
-    candidate = base + "_events.csv"
-    counter = 1
-    while os.path.exists(candidate):
-        candidate = f"{base}_events_{counter}.csv"
+    counter = 0
+    while os.path.exists(events_path_for(video_path, counter, out_dir)):
         counter += 1
-    return candidate
+    return events_path_for(video_path, counter, out_dir)
 
 
 def save_events(video_path, events, fps, total_frames, quiet=False,
-                out_path=None):
+                out_path=None, annotator=None):
     """
     Save atomically: first .tmp, then os.replace(). Never a half-written CSV.
-    out_path allows writing to a different CSV (e.g. video_events_1.csv
-    after a metadata conflict).
+    out_path allows writing to a different CSV (e.g. video.video_truth.1.csv
+    after a metadata conflict). annotator (optional) is written as
+    '# Annotator: ...' metadata line.
+    Returns True on success, False if the file could not be written.
     """
     if out_path is None:
         out_path = events_path_for(video_path)
     tmp_path = out_path + ".tmp"
     frame_ms = 1000.0 / fps
 
-    with open(tmp_path, "w", encoding="utf-8") as f:
+    try:
+        _write_events_file(tmp_path, video_path, events, fps, total_frames,
+                           frame_ms, annotator)
+    except OSError as exc:
+        # e.g. read-only folder or full disk: keep running, report loudly
+        print(f"WARNING: could not write '{tmp_path}' ({exc}). "
+              f"Annotations are NOT saved yet.")
+        return False
+
+    try:
+        os.replace(tmp_path, out_path)  # atomic on all platforms
+    except PermissionError:
+        # CSV e.g. opened in Excel -> .tmp remains as a rescue copy
+        print(f"WARNING: '{out_path}' is locked (opened in Excel?). "
+              f"Rescue copy: {tmp_path}")
+        return False
+    except OSError as exc:
+        print(f"WARNING: could not replace '{out_path}' ({exc}). "
+              f"Rescue copy: {tmp_path}")
+        return False
+    if not quiet:
+        print(f"Saved: {out_path} ({len(events)} events)")
+    return True
+
+
+def _write_events_file(path, video_path, events, fps, total_frames, frame_ms,
+                       annotator=None):
+    """Write metadata header and event lines to `path`."""
+    with open(path, "w", encoding="utf-8") as f:
         # metadata as comment lines (pandas: comment='#')
         f.write(f"# Video: {os.path.basename(video_path)}\n")
         f.write(f"# FPS: {fps:.6f}\n")
         f.write(f"# Frame-Dauer: {frame_ms:.3f} ms\n")
         f.write(f"# Gesamtframes: {total_frames}\n")
         f.write(f"# Video-Dauer: {total_frames * frame_ms / 1000.0:.3f} s\n")
+        if annotator:
+            f.write(f"# Annotator: {sanitize_meta(annotator)}\n")
         f.write(f"# Erstellt: {datetime.now().isoformat(timespec='seconds')}\n")
         f.write("Frame;Timestamp;Event;Flag\n")
         for idx, (name, flag) in sorted(events.items()):
             f.write(f"{idx};{fmt_time(idx / fps)};{name};{sanitize_flag(flag)}\n")
 
-    try:
-        os.replace(tmp_path, out_path)  # atomic on all platforms
-        if not quiet:
-            print(f"Saved: {out_path} ({len(events)} events)")
-    except PermissionError:
-        # CSV e.g. opened in Excel -> .tmp remains as a rescue copy
-        print(f"WARNING: '{out_path}' is locked (opened in Excel?). "
-              f"Rescue copy: {tmp_path}")
+
+# --- Video access ------------------------------------------------------------
+
+class FrameSource:
+    """
+    Decoded-frame access with own index tracking and a cache of window-sized
+    frames.
+
+    goto(target) picks the cheapest way to the target frame: the cache, a
+    sequential read, grab() (decode without colour conversion) for small gaps
+    ahead, or a seek. `idx` is the index of the current frame; `next_pos` the
+    index the next cap.read() returns (None = unknown, next access seeks).
+    """
+
+    def __init__(self, cap, grab_ahead_max):
+        self.cap = cap
+        self.grab_ahead_max = grab_ahead_max
+        self.idx = -1
+        self.next_pos = 0
+        self.raw = None             # full-resolution frame of `idx` (or None)
+        self.cache = OrderedDict()  # idx -> window-sized frame (LRU)
+        self.cache_size = None
+        self.cache_cap = MIN_VIEW_CACHE_FRAMES
+
+    def _read(self):
+        if self.next_pos is None:
+            return False
+        ok, f = self.cap.read()
+        if not ok:
+            self.next_pos = None
+            return False
+        self.idx, self.raw = self.next_pos, f
+        self.next_pos += 1
+        return True
+
+    def _seek(self, target):
+        self.cap.set(cv2.CAP_PROP_POS_FRAMES, target)
+        self.next_pos = target
+        return self._read()
+
+    def goto(self, target):
+        """Make `target` the current frame. False (state kept) on failure."""
+        target = max(target, 0)
+        if target == self.idx and (self.raw is not None or target in self.cache):
+            return True
+        if target in self.cache:
+            self.cache.move_to_end(target)
+            self.idx, self.raw = target, None
+            return True
+        gap = None if self.next_pos is None else target - self.next_pos
+        if gap is not None and 0 <= gap <= self.grab_ahead_max:
+            for _ in range(gap):
+                if not self.cap.grab():
+                    self.next_pos = None
+                    return False
+                self.next_pos += 1
+            return self._read()
+        return self._seek(target)
+
+    def view(self, size):
+        """Current frame resized to `size` (w, h), from/into the cache."""
+        if size != self.cache_size:
+            self.cache.clear()
+            self.cache_size = size
+            self.cache_cap = max(MIN_VIEW_CACHE_FRAMES,
+                                 VIEW_CACHE_BYTES // (size[0] * size[1] * 3))
+        v = self.cache.get(self.idx)
+        if v is not None:
+            self.cache.move_to_end(self.idx)
+            return v
+        if self.raw is None and not self._seek(self.idx):
+            return np.zeros((size[1], size[0], 3), np.uint8)
+        shrink = size[0] < self.raw.shape[1]
+        v = cv2.resize(self.raw, size, interpolation=(
+            cv2.INTER_AREA if shrink else cv2.INTER_LINEAR))
+        self.cache[self.idx] = v
+        while len(self.cache) > self.cache_cap:
+            self.cache.popitem(last=False)
+        return v
 
 
-def do_seek(cap, target):
-    """Jump to a frame and return the new frame (or the old one on failure)."""
-    old_pos = int(cap.get(cv2.CAP_PROP_POS_FRAMES))
-    cap.set(cv2.CAP_PROP_POS_FRAMES, max(target, 0))
-    ret, new_frame = cap.read()
-    if not ret:
-        # seek failed -> restore old position
-        cap.set(cv2.CAP_PROP_POS_FRAMES, old_pos)
-        ret, new_frame = cap.read()
-        if not ret:
-            return False, None
-    return True, new_frame
+def _fingerprint(frame):
+    return hashlib.blake2b(np.ascontiguousarray(frame[::4, ::4]).tobytes(),
+                           digest_size=16).digest()
 
 
-def neighbor_annotation(events, idx, direction):
-    """Frame index of the next (+1) or previous (-1) annotation, or None."""
+def check_seek_accuracy(video_path, total_frames, frames_known):
+    """
+    Compare seeked frames with sequentially decoded ones (first
+    CHECK_SEEK_FRAMES frames). Returns True if every seek landed exactly.
+    """
+    cap = cv2.VideoCapture(video_path)
+    limit = min(total_frames, CHECK_SEEK_FRAMES) if frames_known else CHECK_SEEK_FRAMES
+    print(f"Decoding up to {limit} frames sequentially ...")
+    fps_at = []
+    where = {}  # fingerprint -> frame indices (static scenes repeat)
+    for i in range(limit):
+        ok, f = cap.read()
+        if not ok:
+            break
+        fp = _fingerprint(f)
+        fps_at.append(fp)
+        where.setdefault(fp, []).append(i)
+    n = len(fps_at)
+    if n < 2:
+        print("Too few frames to check.")
+        cap.release()
+        return True
+    targets = sorted({int(n * (k + 1) / (CHECK_SEEK_SAMPLES + 1)) for k in
+                      range(CHECK_SEEK_SAMPLES)} - {0})
+    problems = 0
+    for t in targets:
+        cap.set(cv2.CAP_PROP_POS_FRAMES, t)
+        ok, f = cap.read()
+        if not ok:
+            print(f"  seek to frame {t}: read failed")
+            problems += 1
+            continue
+        fp = _fingerprint(f)
+        if fp == fps_at[t]:
+            continue
+        problems += 1
+        hits = where.get(fp)
+        if hits:
+            j = min(hits, key=lambda i: abs(i - t))
+            print(f"  seek to frame {t} returned frame {j} (off by {j - t:+d})")
+        else:
+            print(f"  seek to frame {t} returned an image that matches no "
+                  f"sequentially decoded frame (decoding artefacts?)")
+    cap.release()
+    if problems:
+        print(f"Seek check: {problems}/{len(targets)} seeks NOT frame-accurate. "
+              f"Re-encode the video (e.g. ffmpeg -i in.mp4 -vf fps=<fps> "
+              f"-g 1 -crf 18 out.mp4) before annotating.")
+        return False
+    print(f"Seek check: all {len(targets)} seeks within the first {n} frames "
+          f"were frame-accurate.")
+    return True
+
+
+# --- Annotations -------------------------------------------------------------
+
+def neighbor_annotation(marks, idx, direction):
+    """Next (+1) or previous (-1) annotated frame in sorted `marks`, or None."""
     if direction > 0:
-        candidates = [i for i in events if i > idx]
-        return min(candidates) if candidates else None
-    candidates = [i for i in events if i < idx]
-    return max(candidates) if candidates else None
+        i = bisect_right(marks, idx)
+        return marks[i] if i < len(marks) else None
+    i = bisect_left(marks, idx)
+    return marks[i - 1] if i > 0 else None
 
 
 def invalid_flight_frames(events):
@@ -436,25 +745,43 @@ def invalid_flight_frames(events):
     return invalid
 
 
-def main():
-    args = sys.argv[1:]
-    if "-h" in args or "--help" in args:
-        print(USAGE)
-        print()
-        print("Options:")
-        print("  -h, --help   show this help")
-        print("  --controls   show the key controls")
-        sys.exit(0)
-
-    if "--controls" in args:
+def parse_args(argv=None):
+    parser = argparse.ArgumentParser(
+        description="Frame-accurate video annotation (takeoff, landing, "
+                    "LED on/off) to <video>.video_truth.csv.")
+    parser.add_argument("video", nargs="?", help="path to the video file")
+    parser.add_argument("-o", "--output-dir", metavar="DIR",
+                        help="folder for the CSV (default: next to the video); "
+                             "created if missing")
+    parser.add_argument("--annotator", metavar="NAME",
+                        help="annotator name, stored in the CSV header "
+                             "(default: keep the one from an existing CSV)")
+    parser.add_argument("--check-seek", action="store_true",
+                        help="check whether seeking in the video is "
+                             "frame-accurate, then exit")
+    parser.add_argument("--controls", action="store_true",
+                        help="show the key controls and exit")
+    args = parser.parse_args(argv)
+    if args.controls:
         print(CONTROLS)
         sys.exit(0)
-
-    if not args:
-        print(USAGE)
+    if args.video is None:
+        parser.print_usage()
         sys.exit(1)
+    return args
 
-    video_path = sys.argv[1]
+
+def main():
+    args = parse_args()
+    video_path = args.video
+    out_dir = args.output_dir
+    if out_dir is not None:
+        try:
+            os.makedirs(out_dir, exist_ok=True)
+        except OSError as exc:
+            print(f"Error: could not create output folder '{out_dir}' ({exc}).")
+            sys.exit(1)
+
     cap = cv2.VideoCapture(video_path)
     if not cap.isOpened():
         print(f"Error: could not open video '{video_path}'.")
@@ -472,25 +799,43 @@ def main():
         print("Warning: frame count unknown, timeline scaling may be inaccurate.")
         total_frames = 1
 
+    if args.check_seek:
+        cap.release()
+        sys.exit(0 if check_seek_accuracy(video_path, total_frames,
+                                          frames_known) else 2)
+
     # --- Load existing CSV and check metadata --------------------------------
-    default_csv = events_path_for(video_path)
+    default_csv = events_path_for(video_path, out_dir=out_dir)
     out_csv = default_csv           # target CSV for all later saves
     events = {}                     # frame_index -> (event_name, flag)
+    annotator = sanitize_meta(args.annotator) if args.annotator else None
 
-    if os.path.exists(default_csv):
-        loaded, metadata, error = load_events(default_csv, fps)
+    # source to resume from: the CSV in the output folder, else one next to
+    # the video (when --output-dir is used), else a legacy <video>_events.csv
+    # (fallbacks are read only; saves go to default_csv)
+    candidates = [default_csv]
+    if out_dir is not None:
+        candidates.append(events_path_for(video_path))
+    candidates.append(legacy_events_path_for(video_path))
+    src_csv = next((p for p in candidates if os.path.exists(p)), None)
+    if src_csv is not None and src_csv != default_csv:
+        print(f"Note: found existing CSV '{src_csv}'; it is kept unchanged, "
+              f"changes are saved to '{default_csv}'.")
+
+    if src_csv is not None:
+        loaded, metadata, error = load_events(src_csv, fps)
         if error is not None:
-            print(f"ERROR: existing CSV '{default_csv}' could not be read "
+            print(f"ERROR: existing CSV '{src_csv}' could not be read "
                   f"({error}). A new CSV will be written; the existing "
                   f"file remains unchanged.")
-            out_csv = find_free_events_path(video_path)
+            out_csv = find_free_events_path(video_path, out_dir)
             print(f"New CSV: {out_csv}")
         else:
             mismatches = check_metadata_match(
                 metadata, video_path, fps, total_frames,
                 fps_known=fps_known, frames_known=frames_known)
             if mismatches:
-                print(f"ERROR: metadata of CSV '{default_csv}' does not "
+                print(f"ERROR: metadata of CSV '{src_csv}' does not "
                       f"match the video:")
                 for m in mismatches:
                     print(f"  - {m}")
@@ -498,15 +843,22 @@ def main():
                       f"discarded, the file itself is kept.)")
                 print("The existing CSV will NOT be overwritten. "
                       "Writing to a new CSV instead:")
-                out_csv = find_free_events_path(video_path)
+                out_csv = find_free_events_path(video_path, out_dir)
                 print(f"  {out_csv}")
-            elif loaded:
-                events = loaded
-                print(f"Loaded: {default_csv} ({len(events)} events, "
-                      f"annotation continues)")
             else:
-                print(f"Note: '{default_csv}' contains no events. "
-                      f"Starting with an empty annotation.")
+                csv_annotator = metadata.get("annotator") or None
+                if annotator is None:
+                    annotator = csv_annotator
+                elif csv_annotator and csv_annotator != annotator:
+                    print(f"Note: annotator changes from '{csv_annotator}' "
+                          f"to '{annotator}' with the next save.")
+                if loaded:
+                    events = loaded
+                    print(f"Loaded: {src_csv} ({len(events)} events, "
+                          f"annotation continues)")
+                else:
+                    print(f"Note: '{src_csv}' contains no events. "
+                          f"Starting with an empty annotation.")
 
     # --- Flag history (free text, e.g. sensor names) ------------------------
     flag_history = load_flag_history(FLAG_HISTORY_PATH)
@@ -516,211 +868,284 @@ def main():
             flag_history.append(flag)
             known.add(flag.lower())
 
-    # Only write the CSV again if annotations actually changed
-    dirty = False
+    # Every change is autosaved immediately. `changed`: any change this
+    # session; `unsaved`: the last save failed (e.g. CSV locked in Excel)
+    # -> retried on exit.
+    changed = False
+    unsaved = False
 
     paused = True
     play_mode = MODE_SKIP   # current playback mode
     skip_step = 2           # SKIP: every n-th frame (2 = every second one)
 
-    ret, frame = cap.read()
-    if not ret:
+    # small gaps are bridged by grab() instead of a seek (a seek decodes
+    # again from the previous keyframe)
+    src = FrameSource(cap, grab_ahead_max=max(2, int(round(fps))))
+    if not src.goto(0):
         print("Error: video contains no frames.")
         sys.exit(1)
+    frame_h, frame_w = src.raw.shape[:2]
+    print(CONTROLS)
 
-    # WINDOW_NORMAL instead of AUTOSIZE: window freely resizable, image scales
+    # WINDOW_NORMAL instead of AUTOSIZE: window freely resizable
     cv2.namedWindow(WIN_NAME, cv2.WINDOW_NORMAL)
 
     # start size: at most MAX_START_W x MAX_START_H, aspect ratio preserved
-    frame_h, frame_w = frame.shape[:2]
     start_scale = min(MAX_START_W / frame_w, MAX_START_H / frame_h, 1.0)
-    cv2.resizeWindow(WIN_NAME, int(frame_w * start_scale),
-                     int(frame_h * start_scale))
+    canvas_size = (max(MIN_CANVAS_W, int(frame_w * start_scale)),
+                   max(MIN_CANVAS_H, int(frame_h * start_scale)))
+    cv2.resizeWindow(WIN_NAME, *canvas_size)
 
-    # real-time clocking: base time and frame index at play start
-    play_start = None       # performance counter value at play start
-    play_start_idx = None   # frame index at play start
+    # clock base: playback time is measured from play_start at frame
+    # play_start_idx (absolute, so no drift accumulates)
+    play_start = None
+    play_start_idx = None
 
-    seek_state = {"seek": -1, "scrubbing": False, "total": total_frames}
+    seek_state = {"seek": -1, "scrubbing": False, "hover": -1,
+                  "total": total_frames, "bar_y0": canvas_size[1],
+                  "width": canvas_size[0]}
 
-    # invalid-sequence set: recomputed only when annotations change,
-    # not on every displayed frame
+    # derived data, recomputed only when annotations change
     invalid_cache = invalid_flight_frames(events)
+    marks = sorted(events)
+    events_version = 0
+    bar_cache = {"key": None, "grey": None, "green": None}
 
     def on_mouse(event, x, y, flags, param):
-        """Click/drag in the progress bar -> set seek target."""
-        if frame is None:
-            return
-        h, w = frame.shape[:2]
-        bar_y0 = h - BAR_H
-        if y < bar_y0:
-            return  # click was in the image, not in the bar
-        frac = min(max(x / w, 0.0), 1.0)
-        target = int(frac * (param["total"] - 1))
-        if event == cv2.EVENT_LBUTTONDOWN:
+        """Timeline: click/drag -> seek target, hover -> preview text."""
+        w = param["width"]
+        frac = min(max(x / max(w - 1, 1), 0.0), 1.0)
+        target = int(round(frac * (param["total"] - 1)))
+        in_bar = y >= param["bar_y0"]
+        if event == cv2.EVENT_LBUTTONDOWN and in_bar:
             param["scrubbing"] = True
             param["seek"] = target
-        elif event == cv2.EVENT_MOUSEMOVE and param["scrubbing"]:
-            param["seek"] = target
-        elif event == cv2.EVENT_LBUTTONUP:
+        elif event == cv2.EVENT_MOUSEMOVE:
+            if param["scrubbing"]:
+                param["seek"] = target  # dragging may leave the bar
+            param["hover"] = target if (in_bar or param["scrubbing"]) else -1
+        elif event == cv2.EVENT_LBUTTONUP and param["scrubbing"]:
             param["scrubbing"] = False
             param["seek"] = target
 
     cv2.setMouseCallback(WIN_NAME, on_mouse, seek_state)
 
-    def cur_index():
-        """Index of the currently displayed frame."""
-        return int(cap.get(cv2.CAP_PROP_POS_FRAMES)) - 1
+    def restart_clock():
+        nonlocal play_start, play_start_idx
+        play_start = time.perf_counter()
+        play_start_idx = src.idx
 
     def jump_to_annotation(direction):
-        """Seek to the next (+1) or previous (-1) annotated frame."""
-        nonlocal ret, frame, paused
-        target = neighbor_annotation(events, cur_index(), direction)
+        """Seek to the next (+1) or previous (-1) annotated frame; without
+        a previous mark, go to the start of the video."""
+        nonlocal paused
+        target = neighbor_annotation(marks, src.idx, direction)
+        if target is None and direction < 0 and src.idx > 0:
+            target = 0
         if target is None:
             print("No annotation in that direction.")
             return
         paused = True
-        ret, frame = do_seek(cap, target)
+        src.goto(target)
 
-    def next_event_text(idx):
-        """Short text: next annotated event including time distance."""
-        upcoming = [(i, entry) for i, entry in sorted(events.items()) if i > idx]
-        if upcoming:
-            i, (n, _) = upcoming[0]
-            return f"next: {n} in {(i - idx) * frame_time_ms:.0f} ms"
-        return "no further events"
+    def neighbor_segments(idx):
+        """Overlay text for the previous and next mark as (text, color)
+        segments; event names in their timeline color."""
+        segs = []
+        p = neighbor_annotation(marks, idx, -1)
+        if p is None:
+            segs.append(("last: none", CYAN))
+        else:
+            name = events[p][0]
+            segs += [("last: ", CYAN),
+                     (name, RED if p in invalid_cache else
+                      TICK_COLORS.get(name, TICK_COLOR_OTHER)),
+                     (f" {(idx - p) * frame_time_ms:.0f} ms ago", CYAN)]
+        segs.append(("   |   ", (150, 150, 150)))
+        n = neighbor_annotation(marks, idx, 1)
+        if n is None:
+            segs.append(("next: none", CYAN))
+        else:
+            name = events[n][0]
+            segs += [("next: ", CYAN),
+                     (name, RED if n in invalid_cache else
+                      TICK_COLORS.get(name, TICK_COLOR_OTHER)),
+                     (f" in {(n - idx) * frame_time_ms:.0f} ms", CYAN)]
+        return segs
 
     def mode_text():
         if play_mode == MODE_REALTIME:
-            return "ECHTZEIT"
+            return "REALTIME"
         return f"SKIP x{skip_step} (every {skip_step}.)"
 
-    def set_playback_mode(pos):
-        """Trackbar callback: 0 = real time, 1-10 = every n-th frame (SKIP)."""
-        nonlocal play_mode, skip_step, play_start, play_start_idx
-        new_mode = MODE_REALTIME if pos <= 0 else MODE_SKIP
-        if new_mode == play_mode and (new_mode == MODE_REALTIME or pos == skip_step):
-            return  # no change -> do nothing (no console spam while dragging)
-        if new_mode == MODE_SKIP:
-            skip_step = pos
-        play_mode = new_mode
-        if not paused and play_mode == MODE_REALTIME:
-            # reset the clock base so the clock does not jump on switching
-            play_start = time.perf_counter()
-            play_start_idx = cur_index()
-        print(f"Playback mode: {mode_text()}")
-
-    def set_mode_from_keys(new_mode, new_step):
-        """Set mode via keyboard and synchronise the visible trackbar."""
-        nonlocal play_mode, skip_step, play_start, play_start_idx
+    def apply_mode(new_mode, new_step, sync_trackbar):
+        """Switch playback mode; restart the clock so playback does not jump."""
+        nonlocal play_mode, skip_step
         if new_mode == play_mode and (new_mode == MODE_REALTIME or new_step == skip_step):
-            return
+            return  # no change -> do nothing (no console spam while dragging)
         if new_mode == MODE_SKIP:
             skip_step = new_step
         play_mode = new_mode
-        if not paused and play_mode == MODE_REALTIME:
-            play_start = time.perf_counter()
-            play_start_idx = cur_index()
-        cv2.setTrackbarPos(TRACKBAR_NAME, WIN_NAME,
-                           0 if play_mode == MODE_REALTIME else skip_step)
+        if not paused:
+            restart_clock()
+        if sync_trackbar:
+            cv2.setTrackbarPos(TRACKBAR_NAME, WIN_NAME,
+                               0 if play_mode == MODE_REALTIME else skip_step)
         print(f"Playback mode: {mode_text()}")
+
+    def events_changed():
+        """Refresh derived data and autosave after a change."""
+        nonlocal invalid_cache, marks, events_version, changed, unsaved
+        invalid_cache = invalid_flight_frames(events)
+        marks = sorted(events)
+        events_version += 1
+        changed = True
+        unsaved = not save_events(video_path, events, fps, total_frames,
+                                  quiet=True, out_path=out_csv,
+                                  annotator=annotator)
+
+    def bar_layers(w, bar_h, s):
+        """Timeline background/fill with ticks; rebuilt only on change."""
+        key = (w, bar_h, events_version)
+        if bar_cache["key"] != key:
+            grey = np.full((bar_h, w, 3), BAR_BG, np.uint8)
+            green = np.full((bar_h, w, 3), BAR_FILL, np.uint8)
+            hw = max(1, int(round(2 * s)))
+            scale = max(total_frames - 1, 1)
+            for mi in marks:
+                mx = int(round(min(mi / scale, 1.0) * (w - 1)))
+                color = (RED if mi in invalid_cache else
+                         TICK_COLORS.get(events[mi][0], TICK_COLOR_OTHER))
+                for layer in (grey, green):
+                    cv2.rectangle(layer, (mx - hw, 0), (mx + hw, bar_h), color, -1)
+            bar_cache.update(key=key, grey=grey, green=green)
+        return bar_cache["grey"], bar_cache["green"]
+
+    def render():
+        """Compose the window image: frame, overlay, banner, timeline."""
+        cw, ch = canvas_size
+        s = ui_scale(cw, ch)
+        bar_h = max(10, int(round(BAR_H * s)))
+        bar_y0 = ch - bar_h
+        seek_state["bar_y0"], seek_state["width"] = bar_y0, cw
+        pad = int(round(10 * s))
+        idx = src.idx
+
+        canvas = np.zeros((ch, cw, 3), np.uint8)
+        vw, vh, ox, oy = fit_rect(frame_w, frame_h, cw, max(1, bar_y0))
+        canvas[oy:oy + vh, ox:ox + vw] = src.view((vw, vh))
+
+        # overlay at the top (semi-transparent): frame/time/state, next event
+        s1, t1 = 0.75 * s, thick(s)
+        s2, t2 = 0.6 * s, thick(s)
+        h1, h2 = text_height(s1, t1), text_height(s2, t2)
+        overlay_h = pad + h1 + pad + h2 + pad
+        darken(canvas, 0, overlay_h)
+        total_txt = f"/{total_frames}" if frames_known else ""
+        info = (f"Frame {idx}{total_txt}   t = {fmt_time(idx / fps)} s   "
+                f"[{'PAUSE' if paused else 'PLAY'}]   {mode_text()}")
+        put_text(canvas, fit_text(info, cw - 2 * pad, s1, t1),
+                 pad, pad + h1, s1, GREEN, t1)
+        put_segments(canvas, neighbor_segments(idx), pad, 2 * pad + h1 + h2,
+                     cw - pad, s2, t2)
+
+        # annotation banner above the timeline (red if illogical sequence)
+        if idx in events:
+            name, flag = events[idx]
+            bad = idx in invalid_cache
+            fg = WHITE if bad else BLACK
+            lines = [(f"MARKED: {name}" + ("  - ILLOGICAL SEQUENCE" if bad else ""),
+                      0.95 * s, thick(s, 2.5))]
+            if flag:
+                lines.append((f"Flag: {flag}", 0.75 * s, thick(s)))
+            heights = [text_height(sc, th) for _, sc, th in lines]
+            banner_h = pad + sum(heights) + pad * len(lines)
+            y0 = max(overlay_h, bar_y0 - banner_h)
+            cv2.rectangle(canvas, (0, y0), (cw, bar_y0),
+                          DARK_RED if bad else ORANGE, -1)
+            y = y0
+            for (text, sc, th), lh in zip(lines, heights):
+                y += pad + lh
+                put_text(canvas, fit_text(text, cw - 2 * pad, sc, th),
+                         pad, y, sc, fg, th)
+
+        # timeline: cached layers, green up to the current position
+        grey, green = bar_layers(cw, bar_h, s)
+        scale = max(total_frames - 1, 1)
+        pos_x = int(round(min(idx / scale, 1.0) * (cw - 1)))
+        bar = canvas[bar_y0:]
+        bar[:, :pos_x] = green[:, :pos_x]
+        bar[:, pos_x:] = grey[:, pos_x:]
+        hw = max(1, int(round(2 * s)))
+        cv2.rectangle(bar, (pos_x - hw, 0), (pos_x + hw, bar_h), WHITE, -1)
+
+        # hover: frame/time (and mark) under the mouse
+        hover = seek_state["hover"]
+        if hover >= 0:
+            hx = int(round(min(hover / scale, 1.0) * (cw - 1)))
+            cv2.line(bar, (hx, 0), (hx, bar_h), (230, 230, 230), 1)
+            tip = f"Frame {hover}  t = {fmt_time(hover / fps)} s"
+            if hover in events:
+                tip += f"  {events[hover][0]}"
+            sc, th = 0.55 * s, thick(s)
+            tw, tth = text_width(tip, sc, th), text_height(sc, th)
+            bw, bh = tw + 2 * pad, tth + pad
+            bx = min(max(hx - bw // 2, 0), max(cw - bw, 0))
+            by = max(bar_y0 - bh - pad // 2, 0)
+            cv2.rectangle(canvas, (bx, by), (bx + bw, by + bh), (40, 40, 40), -1)
+            put_text(canvas, tip, bx + pad, by + bh - pad // 2 - 2, sc, WHITE, th)
+        return canvas
 
     # Slider below the video window: position 0 = real time,
     # positions 1-10 = every n-th frame (SKIP). OpenCV HighGUI has no
     # dropdown menus; a trackbar is the closest control element.
     cv2.createTrackbar(TRACKBAR_NAME, WIN_NAME, skip_step, 10,
-                       set_playback_mode)
+                       lambda pos: apply_mode(
+                           MODE_REALTIME if pos <= 0 else MODE_SKIP, pos, False))
 
+    canvas = None
+    last_render_key = None
     while True:
-        if frame is None:
-            # video became unreadable -> exit cleanly
-            print("No more frames readable, quitting.")
-            break
-
         # window closed via X button -> exit cleanly (with save)
         if cv2.getWindowProperty(WIN_NAME, cv2.WND_PROP_VISIBLE) < 1:
             print("Window closed.")
             break
 
-        display = frame.copy()
-        idx = cur_index()
-        h, w = display.shape[:2]
-
-        # progress bar at the bottom: grey background, green fill,
-        # yellow ticks for annotated frames, red for illogical sequences
-        bar_y0 = h - BAR_H
-        scale = max(total_frames - 1, 1)
-        cv2.rectangle(display, (0, bar_y0), (w, h), (60, 60, 60), -1)
-        pos_x = int(min(idx / scale, 1.0) * w)
-        cv2.rectangle(display, (0, bar_y0), (pos_x, h), (0, 200, 0), -1)
-        for mi in events:
-            mx = int(min(mi / scale, 1.0) * w)
-            color = RED if mi in invalid_cache else YELLOW
-            cv2.rectangle(display, (mx - 2, bar_y0), (mx + 2, h), color, -1)
-
-        # position marker (white)
-        cv2.rectangle(display, (pos_x - 2, bar_y0), (pos_x + 2, h),
-                      (255, 255, 255), -1)
-
-        # annotation banner (orange) above the bar, with the flag if present
-        if idx in events:
-            name, flag = events[idx]
-            if flag:
-                cv2.rectangle(display, (0, h - BAR_H - 130), (w, h - BAR_H),
-                              (0, 120, 255), -1)
-                cv2.putText(display, f"MARKED: {name}",
-                            (10, h - BAR_H - 84), cv2.FONT_HERSHEY_SIMPLEX,
-                            1.6, (0, 0, 0), 4, cv2.LINE_AA)
-                cv2.putText(display, f"Flag: {flag}",
-                            (10, h - BAR_H - 24), cv2.FONT_HERSHEY_SIMPLEX,
-                            1.2, (0, 0, 0), 3, cv2.LINE_AA)
-            else:
-                cv2.rectangle(display, (0, h - BAR_H - 80), (w, h - BAR_H),
-                              (0, 120, 255), -1)
-                cv2.putText(display, f"MARKED: {name}",
-                            (10, h - BAR_H - 24), cv2.FONT_HERSHEY_SIMPLEX,
-                            1.6, (0, 0, 0), 4, cv2.LINE_AA)
-
-        # overlay at the top: frame, time, status, playback mode
-        total_txt = f"/{total_frames}" if frames_known else ""
-        if idx in events:
-            name, flag = events[idx]
-            marked = ("  [MARKED - ILLOGICAL SEQUENCE]" if idx in invalid_cache
-                      else "  [MARKED]")
-            if flag:
-                marked += f"  flag: {flag}"
-        else:
-            marked = ""
-        info = (f"Frame {idx}{total_txt}  "
-                f"t = {fmt_time(idx / fps)} s  "
-                f"[{'PAUSE' if paused else 'PLAY'}] {mode_text()}{marked}")
-        cv2.rectangle(display, (0, 0), (w, OVERLAY_H), (0, 0, 0), -1)
-        cv2.putText(display, info, (10, 40), cv2.FONT_HERSHEY_SIMPLEX,
-                    1.3, (0, 255, 0), 4, cv2.LINE_AA)
-        cv2.putText(display, next_event_text(idx), (10, 84),
-                    cv2.FONT_HERSHEY_SIMPLEX, 1.0, (255, 255, 0), 3, cv2.LINE_AA)
-
-        cv2.imshow(WIN_NAME, display)
+        # draw at window resolution; skip redraw if nothing visible changed
+        _, _, rw, rh = cv2.getWindowImageRect(WIN_NAME)
+        if rw > 0 and rh > 0:
+            canvas_size = (max(rw, MIN_CANVAS_W), max(rh, MIN_CANVAS_H))
+        render_key = (src.idx, events_version, paused, play_mode, skip_step,
+                      canvas_size, seek_state["hover"])
+        if render_key != last_render_key:
+            canvas = render()
+            cv2.imshow(WIN_NAME, canvas)
+            last_render_key = render_key
 
         # --- Clocking ---
-        # ECHTZEIT: compute the target time of the NEXT frame absolutely and
-        # wait only the remaining time -> no cumulative drift.
-        # SKIP n: each shown frame stays for one normal frame duration
-        # -> n-fold speed.
+        # Both modes: the due time of the NEXT shown frame is computed from
+        # the absolute clock base, we wait only the remaining time -> no
+        # cumulative drift. REALTIME: next frame at 1/fps. SKIP n: n frames
+        # further, still 1/fps later (n-fold speed).
         # Pause: poll briefly so mouse scrubbing keeps working.
         if paused:
-            key = cv2.waitKeyEx(30) & 0xFFFFFFFF
-        elif play_mode == MODE_SKIP:
-            key = cv2.waitKeyEx(max(1, int(round(frame_time_ms)))) & 0xFFFFFFFF
-        else:  # MODE_REALTIME
+            wait_ms = PAUSED_POLL_MS
+        else:
+            speed = 1 if play_mode == MODE_REALTIME else skip_step
             elapsed = time.perf_counter() - play_start
-            due = (cur_index() + 1 - play_start_idx) / fps  # target time of next frame
-            key = cv2.waitKeyEx(max(1, int(round((due - elapsed) * 1000)))) & 0xFFFFFFFF
+            due = (src.idx + speed - play_start_idx) / (fps * speed)
+            if play_mode == MODE_SKIP and elapsed - due > SKIP_RESYNC_S:
+                # decoding cannot keep up with n-fold speed: show every n-th
+                # frame as fast as possible instead of rushing to catch up
+                restart_clock()
+                elapsed, due = 0.0, 1.0 / fps
+            wait_ms = max(1, int(round((due - elapsed) * 1000)))
+        key = cv2.waitKeyEx(wait_ms) & 0xFFFFFFFF
 
         # process timeline seek (pauses automatically)
         if seek_state["seek"] >= 0:
             paused = True
-            ret, frame = do_seek(cap, seek_state["seek"])
+            src.goto(seek_state["seek"])
             seek_state["seek"] = -1
 
         key = normalize_key(key)  # Caps Lock: letters arrive uppercase
@@ -730,35 +1155,29 @@ def main():
         elif key == 32:  # space bar
             paused = not paused
             if not paused:
-                play_start = time.perf_counter()
-                play_start_idx = cur_index()
-        elif key == 2555904 or key == ord('d'):  # right arrow / d
+                restart_clock()
+        elif key == KEY_RIGHT or key == ord('d'):
             # at the known end, stay put, no faulty seek
-            if frames_known and cur_index() >= total_frames - 1:
-                pass
-            else:
+            if not (frames_known and src.idx >= total_frames - 1):
                 paused = True
-                ret, frame = cap.read()
-                if not ret:
-                    ret, frame = do_seek(cap, cur_index())
-        elif key == 2424832 or key == ord('a'):  # left arrow / a
+                src.goto(src.idx + 1)
+        elif key == KEY_LEFT or key == ord('a'):
             paused = True
-            ret, frame = do_seek(cap, cur_index() - 1)
-        elif key == 2228224 or key == ord('.'):  # PageDown / .: next mark
+            if src.idx > 0:
+                src.goto(src.idx - 1)
+        elif key == KEY_PAGE_DOWN or key == ord('.'):
             jump_to_annotation(1)
-        elif key == 2162688 or key == ord(','):  # PageUp / ,: previous mark
+        elif key == KEY_PAGE_UP or key == ord(','):
             jump_to_annotation(-1)
         elif key == ord('m'):
-            # toggle mode
-            set_mode_from_keys(
-                MODE_SKIP if play_mode == MODE_REALTIME else MODE_REALTIME,
-                skip_step)
+            apply_mode(MODE_SKIP if play_mode == MODE_REALTIME else MODE_REALTIME,
+                       skip_step, True)
         elif ord('1') <= key <= ord('9'):  # skip step 1-9
-            set_mode_from_keys(MODE_SKIP, key - ord('0'))
+            apply_mode(MODE_SKIP, key - ord('0'), True)
         elif key == ord('0'):  # skip step 10
-            set_mode_from_keys(MODE_SKIP, 10)
+            apply_mode(MODE_SKIP, 10, True)
         elif key in (ord('o'), ord('l'), ord('t'), ord('f')):
-            idx = cur_index()
+            idx = src.idx
             name = {ord('o'): "Takeoff", ord('l'): "Landing",
                     ord('t'): "LED on", ord('f'): "LED off"}[key]
             # re-marking an existing frame changes only the name, the
@@ -769,23 +1188,23 @@ def main():
                       f"-> overwritten")
             events[idx] = (name, old_flag)
             print(f"{name} @ t = {fmt_time(idx / fps)} s (frame {idx})")
-            invalid_cache = invalid_flight_frames(events)
+            events_changed()
             if idx in invalid_cache:
                 print("WARNING: illogical sequence - two takeoffs or two "
                       "landings in a row! (red in the timeline)")
-            dirty = True
-            save_events(video_path, events, fps, total_frames, quiet=True,
-                        out_path=out_csv)  # autosave
         elif key == ord('c'):
-            idx = cur_index()
+            idx = src.idx
             if idx not in events:
                 print("Current frame is not annotated - mark it first "
                       "(o/l/t/f), then press c to add a flag.")
             else:
                 paused = True  # no playback while editing
+                canvas = render()  # base image must show the paused state
                 name, old_flag = events[idx]
-                text, committed = edit_flag_text(display, name, old_flag,
-                                                 flag_history)
+                text, committed = edit_flag_text(
+                    canvas, name, old_flag, flag_history,
+                    canvas.shape[0] - seek_state["bar_y0"])
+                last_render_key = None  # editor drew over the window
                 if committed:
                     new_flag = sanitize_flag(text)
                     events[idx] = (name, new_flag)
@@ -795,75 +1214,56 @@ def main():
                         print(f"Flag @ frame {idx}: '{new_flag}'")
                     else:
                         print(f"Flag removed @ frame {idx}")
-                    dirty = True
-                    save_events(video_path, events, fps, total_frames,
-                                quiet=True, out_path=out_csv)  # autosave
+                    events_changed()
                 else:
                     print("Flag edit cancelled.")
         elif key == ord('u'):
-            idx = cur_index()
+            idx = src.idx
             if idx in events:
                 name, flag = events.pop(idx)
                 suffix = f" (flag: {flag})" if flag else ""
                 print(f"Deleted: {name}{suffix} @ frame {idx}")
-                invalid_cache = invalid_flight_frames(events)
-                dirty = True
-                save_events(video_path, events, fps, total_frames, quiet=True,
-                            out_path=out_csv)  # autosave
+                events_changed()
             else:
                 print("Current frame is not annotated.")
         elif key == ord('s'):
-            save_events(video_path, events, fps, total_frames, quiet=True,
-                        out_path=out_csv)
-            print("Saved manually.")
-            dirty = False  # just saved -> nothing unsaved anymore
+            if save_events(video_path, events, fps, total_frames,
+                           quiet=True, out_path=out_csv, annotator=annotator):
+                print("Saved manually.")
+                unsaved = False
 
         if not paused:
             if play_mode == MODE_SKIP:
-                # show every n-th frame: read n frames sequentially,
-                # display the last one. Sequential reading is usually faster
-                # than a seek; only the display is skipped.
-                for _ in range(skip_step):
-                    ret, frame = cap.read()
-                    if not ret:
-                        break
-                if not ret:
-                    # end of video -> pause, jump back to the start
-                    paused = True
-                    ret, frame = do_seek(cap, 0)
+                # every n-th frame: the n-1 frames in between are only
+                # grabbed (decoded without colour conversion)
+                target = src.idx + skip_step
             else:
-                # ECHTZEIT: target frame according to the clock; if decoding
-                # cannot keep up, jump directly to the target frame (frames
-                # are skipped) so playback stays in real time.
-                target_idx = play_start_idx + int(
-                    (time.perf_counter() - play_start) * fps)
-                if target_idx > cur_index() + 1:
-                    ok, new_frame = do_seek(cap, target_idx)
-                    if ok:
-                        frame = new_frame
-                    else:
-                        # jump failed (usually end of video)
-                        paused = True
-                        ret, frame = do_seek(cap, 0)
-                else:
-                    # on schedule: continue reading sequentially (faster than seek)
-                    ret, frame = cap.read()
-                    if not ret:
-                        # end of video -> pause, jump back to the start
-                        paused = True
-                        ret, frame = do_seek(cap, 0)
+                # REALTIME: target frame according to the clock; if decoding
+                # cannot keep up, frames are skipped (grab for small gaps,
+                # seek for large ones) so playback stays in real time
+                target = max(src.idx + 1, play_start_idx + int(
+                    (time.perf_counter() - play_start) * fps))
+            if not src.goto(target):
+                # end of video -> pause, jump back to the start
+                paused = True
+                src.goto(0)
 
     cap.release()
     cv2.destroyAllWindows()
 
-    # Final save - only if annotations actually changed since loading.
-    # In a conflict case (suffixed CSV) this prevents empty _1/_2 files
-    # when the user merely opened and closed the video.
-    if dirty:
-        save_events(video_path, events, fps, total_frames, quiet=True,
-                    out_path=out_csv)
+    # Changes are autosaved, so a final save is only needed to retry a
+    # failed one. Without changes nothing is written (no empty .1/.2 files
+    # when a video is merely opened and closed).
+    if unsaved and not save_events(video_path, events, fps, total_frames,
+                                   quiet=True, out_path=out_csv,
+                                   annotator=annotator):
+        print("Finished. WARNING: last changes could NOT be saved "
+              "(see rescue copy above).")
+    elif changed:
         print(f"Finished. {len(events)} events in {out_csv}")
     else:
         print("Finished. No changes, CSV not rewritten.")
+
+
 if __name__ == "__main__":
     main()
