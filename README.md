@@ -66,7 +66,7 @@ When you open a video that already has an `<video>.video_truth.csv` (next to it,
 2. **Metadata mismatch** (e.g. the CSV belongs to a different video, a re-encoded version, or a different frame rate) → an error message with the differing fields is printed to the console. The existing CSV is **never overwritten**; instead a new CSV with a suffix is written (`video.video_truth.1.csv`, `video.video_truth.2.csv`, …). Autosave, manual save and the final save on exit all target that same new file, so the original stays untouched.
 3. **Unreadable CSV** (corrupt file/encoding) → same behaviour as a mismatch: error message, old file kept, new suffixed CSV.
 
-On the next start the tool resumes the file that belongs to the video: if the unnumbered CSV still mismatches, an existing numbered CSV (which was written for this video) is used instead of creating yet another one.
+On the next start the tool resumes the file that belongs to the video: if the unnumbered CSV still mismatches, an existing numbered CSV (which was written for this video) is used instead of creating yet another one. In that case the unnumbered CSV is left untouched and changes go back to the resumed numbered CSV (for a read-only legacy file, to a new numbered CSV).
 
 Notes:
 

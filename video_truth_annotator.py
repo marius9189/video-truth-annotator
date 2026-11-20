@@ -393,21 +393,26 @@ def load_events(csv_path, fps):
     """
     Read in an existing events CSV.
 
-    Returns: (events_dict, metadata_dict, error)
+    Returns: (events_dict, metadata_dict, error, warnings)
       events_dict  : {frame_index: (event_name, flag)}
       metadata_dict: {"video": ..., "fps": ..., "gesamtframes": ...,
                       "annotator": ... (optional)} or {}
       error        : None or description of why the file was not readable
+      warnings     : list of human-readable warning messages, empty if none
 
     Data validation:
-      - negative frame indices are rejected (with a console message)
+      - negative frame indices are rejected (reported via `warnings`)
       - the timestamp column is compared against frame/fps; deviations
         larger than TIMESTAMP_TOLERANCE_MS are reported (the frame
         index, not the timestamp, is the source of truth)
       - files without the flag column (older CSVs) are read as flag ""
+
+    Warnings are returned instead of printed so the caller can report them
+    only for the file it actually uses.
     """
     events = {}
     metadata = {}
+    warnings = []
     rejected = 0
     ts_warnings = 0
     try:
@@ -449,15 +454,17 @@ def load_events(csv_path, fps):
                 if event_name:
                     events[frame_idx] = (event_name, flag)
         if rejected:
-            print(f"Warning: {rejected} line(s) with negative frame index "
-                  f"ignored in '{csv_path}'.")
+            warnings.append(
+                f"Warning: {rejected} line(s) with negative frame index "
+                f"ignored in '{csv_path}'.")
         if ts_warnings:
-            print(f"Warning: {ts_warnings} timestamp(s) in '{csv_path}' do "
-                  f"not match frame/fps (>{TIMESTAMP_TOLERANCE_MS:.0f} ms). "
-                  f"The frame index is used as source of truth.")
-        return events, metadata, None
+            warnings.append(
+                f"Warning: {ts_warnings} timestamp(s) in '{csv_path}' do "
+                f"not match frame/fps (>{TIMESTAMP_TOLERANCE_MS:.0f} ms). "
+                f"The frame index is used as source of truth.")
+        return events, metadata, None, warnings
     except (OSError, UnicodeDecodeError) as exc:
-        return {}, None, str(exc)
+        return {}, None, str(exc), warnings
 
 
 def check_metadata_match(metadata, video_path, fps, total_frames,
@@ -532,8 +539,9 @@ def numbered_events_paths(video_path, out_dir=None):
             path = events_path_for(video_path, counter, d)
             if not os.path.exists(path):
                 break
-            if path not in seen:
-                seen.add(path)
+            key = os.path.normcase(os.path.abspath(path))
+            if key not in seen:
+                seen.add(key)
                 yield path
             counter += 1
 
@@ -559,19 +567,21 @@ def select_resume_source(video_path, out_dir, default_csv, fps, total_frames,
     paths.extend(numbered_events_paths(video_path, out_dir))
     if out_dir is not None:  # also look next to the video
         paths.append(events_path_for(video_path))
-        paths.extend(numbered_events_paths(video_path))
     paths.append(legacy_events_path_for(video_path))
 
     existing = []
+    seen = set()
     for p in paths:
-        if p not in existing and os.path.exists(p):
+        key = os.path.normcase(os.path.abspath(p))
+        if key not in seen and os.path.exists(p):
+            seen.add(key)
             existing.append(p)
     if not existing:
         return None, {}, {}, None
 
     first = None
     for path in existing:
-        loaded, metadata, error = load_events(path, fps)
+        loaded, metadata, error, warnings = load_events(path, fps)
         if first is None:
             first = (path, loaded, metadata, error)
         if error is None and not check_metadata_match(
@@ -580,6 +590,8 @@ def select_resume_source(video_path, out_dir, default_csv, fps, total_frames,
             if path != first[0]:
                 print(f"Note: '{first[0]}' does not match the video; "
                       f"resuming '{path}' instead.")
+            for w in warnings:  # only the file actually resumed
+                print(w)
             return path, loaded, metadata, None
     return first
 
@@ -885,10 +897,6 @@ def main():
         video_path, out_dir, default_csv, fps, total_frames,
         fps_known, frames_known)
 
-    if src_csv is not None and src_csv != default_csv:
-        print(f"Note: found existing CSV '{src_csv}'; it is kept unchanged, "
-              f"changes are saved to '{default_csv}'.")
-
     if src_csv is not None:
         if error is not None:
             print(f"ERROR: existing CSV '{src_csv}' could not be read "
@@ -912,6 +920,26 @@ def main():
                 out_csv = find_free_events_path(video_path, out_dir)
                 print(f"  {out_csv}")
             else:
+                # A matching file that is not the default is resumed. If the
+                # default exists as well it belongs to another video (it was
+                # not chosen above), so it must not be overwritten.
+                if src_csv != default_csv and os.path.exists(default_csv):
+                    if src_csv == legacy_events_path_for(video_path):
+                        # the legacy file is read-only: seed a new numbered CSV
+                        out_csv = find_free_events_path(video_path, out_dir)
+                        print(f"Note: resuming '{src_csv}'; the legacy file "
+                              f"stays unchanged, changes are saved to "
+                              f"'{out_csv}'.")
+                    else:
+                        out_csv = src_csv
+                        print(f"Note: resuming '{src_csv}' (it matches the "
+                              f"video); changes are written back to it. "
+                              f"'{default_csv}' does not match and is left "
+                              f"untouched.")
+                elif src_csv != default_csv:
+                    print(f"Note: found existing CSV '{src_csv}'; it is "
+                          f"kept unchanged, changes are saved to "
+                          f"'{default_csv}'.")
                 csv_annotator = metadata.get("annotator") or None
                 if annotator is None:
                     annotator = csv_annotator
