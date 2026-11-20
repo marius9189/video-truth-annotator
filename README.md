@@ -66,6 +66,8 @@ When you open a video that already has an `<video>.video_truth.csv` (next to it,
 2. **Metadata mismatch** (e.g. the CSV belongs to a different video, a re-encoded version, or a different frame rate) → an error message with the differing fields is printed to the console. The existing CSV is **never overwritten**; instead a new CSV with a suffix is written (`video.video_truth.1.csv`, `video.video_truth.2.csv`, …). Autosave, manual save and the final save on exit all target that same new file, so the original stays untouched.
 3. **Unreadable CSV** (corrupt file/encoding) → same behaviour as a mismatch: error message, old file kept, new suffixed CSV.
 
+On the next start the tool resumes the file that belongs to the video: if the unnumbered CSV still mismatches, an existing numbered CSV (which was written for this video) is used instead of creating yet another one. In that case the unnumbered CSV is left untouched and changes go back to the resumed numbered CSV (for a read-only legacy file, to a new numbered CSV).
+
 Notes:
 
 - Fields the video itself does not report (unknown frame rate or frame count) are skipped in the check — a comparison against the fallback value (30 fps) would produce false conflicts.
@@ -151,7 +153,7 @@ Takeoff and landing must **strictly alternate** — each jump consists of exactl
 ## Notes
 
 - Closing the window (X button) exits the program cleanly, like `q`/`ESC`
-- If the total frame count of the video is unknown, the program warns; the timeline scaling may then be inaccurate
+- If the total frame count of the video is unknown, the program warns and disables the timeline (clicking/dragging/hovering does nothing); frame stepping and jumping still work
 - At the end of the video, playback pauses automatically and jumps back to the start
 - Text overlays use OpenCV's built-in fonts, which cannot draw umlauts or other non-ASCII characters
 
