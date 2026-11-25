@@ -44,7 +44,10 @@ Window freely resizable (WINDOW_NORMAL); 4K videos are scaled down to a
 maximum of 1280x720 at startup, aspect ratio is preserved. The frame is
 scaled to the window before the overlay is drawn, so the overlay has the
 same size for every video resolution, and recently shown frames are cached
-so stepping backwards does not need a seek.
+so stepping backwards does not need a seek. On the Qt backend (Linux
+packages) OpenCV's own toolbar and statusbar are disabled
+(WINDOW_GUI_NORMAL): they are useless here and steal the focus, after which
+the arrow keys no longer reach the player on Linux.
 For frame-by-frame annotation the playback mode is irrelevant:
 all frames remain individually addressable (arrow keys). Letter keys also
 work with Caps Lock enabled (uppercase input is normalised to lowercase).
@@ -981,8 +984,12 @@ def main():
     frame_h, frame_w = src.raw.shape[:2]
     print(CONTROLS)
 
-    # WINDOW_NORMAL instead of AUTOSIZE: window freely resizable
-    cv2.namedWindow(WIN_NAME, cv2.WINDOW_NORMAL)
+    # WINDOW_NORMAL instead of AUTOSIZE: window freely resizable.
+    # WINDOW_GUI_NORMAL: on the Qt backend (Linux wheels) OpenCV otherwise draws
+    # its own toolbar/statusbar (WINDOW_GUI_EXPANDED is the default there) and
+    # that toolbar steals the focus, so arrow keys no longer reach waitKey().
+    # No effect on the Windows (Win32) backend.
+    cv2.namedWindow(WIN_NAME, cv2.WINDOW_NORMAL | cv2.WINDOW_GUI_NORMAL)
 
     # start size: at most MAX_START_W x MAX_START_H, aspect ratio preserved
     start_scale = min(MAX_START_W / frame_w, MAX_START_H / frame_h, 1.0)
