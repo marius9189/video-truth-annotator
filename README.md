@@ -95,7 +95,7 @@ Notes:
 | **`1`–`9`, `0`** | Show every n-th frame (1–10), switches to SKIP |
 | **`q` / `ESC`** | Quit (saves automatically) |
 
-The playback mode can also be selected with the **slider below the video** (trackbar): position 0 = real time, position 1–10 = skip. The strip below the timeline labels the slider (the trackbar's own label is not reliably visible on every OpenCV backend). Every change is saved immediately. When quitting via the window's X button or `q`/`ESC`, a save that failed earlier (e.g. CSV locked in Excel) is retried once more; without changes nothing is written (`Finished. No changes, CSV not rewritten.`).
+The playback mode is selected with `m` (REALTIME ↔ SKIP) and `1`–`9`/`0` (SKIP with step 1–10); the current mode is shown in the overlay at the top. When quitting via the window's X button or `q`/`ESC`, a save that failed earlier (e.g. CSV locked in Excel) is retried once more; without changes nothing is written (`Finished. No changes, CSV not rewritten.`).
 
 `PageDown`/`.` and `PageUp`/`,` jump to the next/previous annotated frame (pausing playback). Without an earlier mark, `PageUp`/`,` jumps to the start of the video; without a later mark, `PageDown`/`.` prints a note and stays put. Shift/Ctrl + arrow combinations are **not** usable for this: OpenCV's `waitKeyEx` only reports the bare arrow key code on Windows and drops the modifier, so dedicated keys are used instead.
 

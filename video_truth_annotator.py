@@ -26,7 +26,7 @@ the video itself does not report are skipped in the check.
 
 Key controls: printed with --controls.
 
-Playback mode (also selectable via the slider below the video):
+Playback mode (keys m and 1-10):
   REALTIME : target time of each frame from an absolute time counter; if
              decoding cannot keep up, frames are skipped (decoded without
              display, or a seek for large gaps), never slower than real time.
@@ -48,8 +48,7 @@ cached so stepping backwards does not need a seek. WINDOW_FREERATIO is
 required on the Qt/Wayland backends (Linux packages), where keeping the
 image ratio (WINDOW_KEEPRATIO) is the default: they shrink the image view to
 the image's aspect ratio and centre it in the window, leaving grey bands
-around the video. The strip below the timeline labels the trackbar, because
-the trackbar's own label is not reliably visible on every backend.
+around the video.
 On the Qt backend (Linux packages) OpenCV's own toolbar and statusbar are
 disabled (WINDOW_GUI_NORMAL): they are useless here and steal the focus, after
 which the arrow keys no longer reach the player on Linux.
@@ -80,7 +79,6 @@ import numpy as np
 WIN_NAME = ("Video Truth Player - Space: Play/Pause, Arrows: Frame, "
             "o/l: Takeoff/Landing, t/f: LED on/off, c: Flag, u: Delete, "
             ",/.: Prev/Next mark, s: Save, q: Quit")
-TRACKBAR_NAME = "Playback mode"
 
 MAX_START_W = 1280  # start window: max. width
 MAX_START_H = 720   # start window: max. height
@@ -91,7 +89,6 @@ REF_W, REF_H = 1280, 720
 UI_SCALE_MIN, UI_SCALE_MAX = 0.5, 2.0
 MIN_CANVAS_W, MIN_CANVAS_H = 160, 120
 BAR_H = 26          # height of the timeline at the bottom
-CAPTION_H = 20      # caption strip below the timeline (labels the slider)
 FONT = cv2.FONT_HERSHEY_SIMPLEX
 
 VIEW_CACHE_BYTES = 256 * 1024 * 1024  # budget for cached, window-sized frames
@@ -125,8 +122,6 @@ ORANGE = (0, 120, 255)   # banner: marked frame
 DARK_RED = (0, 0, 170)   # banner: marked frame with illogical sequence
 BAR_BG = (60, 60, 60)      # timeline: unplayed part (dark grey)
 BAR_FILL = (170, 170, 170)  # timeline: played part (light grey, distinct from tick colors)
-CAPTION_BG = (35, 35, 35)  # strip under the timeline that labels the slider
-CAPTION_FG = (200, 200, 200)
 
 KEY_RIGHT = 2555904
 KEY_LEFT = 2424832
@@ -1016,7 +1011,7 @@ def main():
     play_start_idx = None
 
     seek_state = {"seek": -1, "scrubbing": False, "hover": -1,
-                  "total": total_frames, "bar_y0": canvas_size[1], "bar_h": 0,
+                  "total": total_frames, "bar_y0": canvas_size[1],
                   "width": canvas_size[0], "enabled": frames_known}
 
     # derived data, recomputed only when annotations change
@@ -1032,7 +1027,7 @@ def main():
         w = param["width"]
         frac = min(max(x / max(w - 1, 1), 0.0), 1.0)
         target = int(round(frac * (param["total"] - 1)))
-        in_bar = param["bar_y0"] <= y < param["bar_y0"] + param["bar_h"]
+        in_bar = y >= param["bar_y0"]
         if event == cv2.EVENT_LBUTTONDOWN and in_bar:
             param["scrubbing"] = True
             param["seek"] = target
@@ -1094,19 +1089,16 @@ def main():
             return "REALTIME"
         return f"SKIP x{skip_step} (every {skip_step}.)"
 
-    def apply_mode(new_mode, new_step, sync_trackbar):
+    def apply_mode(new_mode, new_step):
         """Switch playback mode; restart the clock so playback does not jump."""
         nonlocal play_mode, skip_step
         if new_mode == play_mode and (new_mode == MODE_REALTIME or new_step == skip_step):
-            return  # no change -> do nothing (no console spam while dragging)
+            return  # no change -> do nothing (no console spam)
         if new_mode == MODE_SKIP:
             skip_step = new_step
         play_mode = new_mode
         if not paused:
             restart_clock()
-        if sync_trackbar:
-            cv2.setTrackbarPos(TRACKBAR_NAME, WIN_NAME,
-                               0 if play_mode == MODE_REALTIME else skip_step)
         print(f"Playback mode: {mode_text()}")
 
     def events_changed():
@@ -1138,14 +1130,12 @@ def main():
         return bar_cache["grey"], bar_cache["fill"]
 
     def render():
-        """Compose the window image: frame, overlay, banner, timeline, caption."""
+        """Compose the window image: frame, overlay, banner, timeline."""
         cw, ch = canvas_size
         s = ui_scale(cw, ch)
-        cap_h = min(max(0, int(round(CAPTION_H * s))), max(0, ch // 4))
-        bar_h = min(max(10, int(round(BAR_H * s))), max(1, ch - cap_h))
-        bar_y0 = ch - cap_h - bar_h
-        seek_state["bar_y0"], seek_state["bar_h"], seek_state["width"] = (
-            bar_y0, bar_h, cw)
+        bar_h = min(max(10, int(round(BAR_H * s))), ch)
+        bar_y0 = ch - bar_h
+        seek_state["bar_y0"], seek_state["width"] = bar_y0, cw
         pad = int(round(10 * s))
         idx = src.idx
 
@@ -1189,7 +1179,7 @@ def main():
 
         # timeline: cached layers, fill up to the current position
         grey, fill = bar_layers(cw, bar_h, s)
-        bar = canvas[bar_y0:bar_y0 + bar_h]
+        bar = canvas[bar_y0:]
         if frames_known:
             scale = max(total_frames - 1, 1)
             pos_x = int(round(min(idx / scale, 1.0) * (cw - 1)))
@@ -1200,18 +1190,6 @@ def main():
         else:
             bar[:, :] = grey  # no frame count -> no meaningful position
 
-        # caption strip below the timeline: labels the trackbar below the
-        # window. The trackbar has no visible label of its own on every
-        # backend (Qt hides/shortens it), so the slider is explained here.
-        if cap_h > 1:
-            caption = canvas[bar_y0 + bar_h:]
-            caption[:] = CAPTION_BG
-            sc, th = 0.55 * s, max(1, thick(s, 1))
-            put_text(canvas,
-                     fit_text("Playback mode (slider below): 0 = real time, "
-                              "1-10 = every n-th frame", cw - 2 * pad, sc, th),
-                     pad, bar_y0 + bar_h + (cap_h + text_height(sc, th)) // 2 - 1,
-                     sc, CAPTION_FG, th)
 
         # hover: frame/time (and mark) under the mouse
         hover = seek_state["hover"]
@@ -1229,13 +1207,6 @@ def main():
             cv2.rectangle(canvas, (bx, by), (bx + bw, by + bh), (40, 40, 40), -1)
             put_text(canvas, tip, bx + pad, by + bh - pad // 2 - 2, sc, WHITE, th)
         return canvas
-
-    # Slider below the video window: position 0 = real time,
-    # positions 1-10 = every n-th frame (SKIP). OpenCV HighGUI has no
-    # dropdown menus; a trackbar is the closest control element.
-    cv2.createTrackbar(TRACKBAR_NAME, WIN_NAME, skip_step, 10,
-                       lambda pos: apply_mode(
-                           MODE_REALTIME if pos <= 0 else MODE_SKIP, pos, False))
 
     canvas = None
     last_render_key = None
@@ -1305,11 +1276,11 @@ def main():
             jump_to_annotation(-1)
         elif key == ord('m'):
             apply_mode(MODE_SKIP if play_mode == MODE_REALTIME else MODE_REALTIME,
-                       skip_step, True)
+                       skip_step)
         elif ord('1') <= key <= ord('9'):  # skip step 1-9
-            apply_mode(MODE_SKIP, key - ord('0'), True)
+            apply_mode(MODE_SKIP, key - ord('0'))
         elif key == ord('0'):  # skip step 10
-            apply_mode(MODE_SKIP, 10, True)
+            apply_mode(MODE_SKIP, 10)
         elif key in (ord('o'), ord('l'), ord('t'), ord('f')):
             idx = src.idx
             name = {ord('o'): "Takeoff", ord('l'): "Landing",
