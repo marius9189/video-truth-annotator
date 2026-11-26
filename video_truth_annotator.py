@@ -40,14 +40,19 @@ Timeline:
   magenta, LED on yellow, LED off orange), RED ticks = illogical sequence (two takeoffs or two landings directly in a row, without the
   respective counterpart in between).
 
-Window freely resizable (WINDOW_NORMAL); 4K videos are scaled down to a
-maximum of 1280x720 at startup, aspect ratio is preserved. The frame is
-scaled to the window before the overlay is drawn, so the overlay has the
-same size for every video resolution, and recently shown frames are cached
-so stepping backwards does not need a seek. On the Qt backend (Linux
-packages) OpenCV's own toolbar and statusbar are disabled
-(WINDOW_GUI_NORMAL): they are useless here and steal the focus, after which
-the arrow keys no longer reach the player on Linux.
+Window freely resizable (WINDOW_NORMAL + WINDOW_FREERATIO); 4K videos are
+scaled down to a maximum of 1280x720 at startup, aspect ratio is preserved.
+The frame is scaled to the window before the overlay is drawn, so the overlay
+has the same size for every video resolution, and recently shown frames are
+cached so stepping backwards does not need a seek. WINDOW_FREERATIO is
+required on the Qt/Wayland backends (Linux packages), where keeping the
+image ratio (WINDOW_KEEPRATIO) is the default: they shrink the image view to
+the image's aspect ratio and centre it in the window, leaving grey bands
+around the video. The strip below the timeline labels the trackbar, because
+the trackbar's own label is not reliably visible on every backend.
+On the Qt backend (Linux packages) OpenCV's own toolbar and statusbar are
+disabled (WINDOW_GUI_NORMAL): they are useless here and steal the focus, after
+which the arrow keys no longer reach the player on Linux.
 For frame-by-frame annotation the playback mode is irrelevant:
 all frames remain individually addressable (arrow keys). Letter keys also
 work with Caps Lock enabled (uppercase input is normalised to lowercase).
@@ -75,7 +80,7 @@ import numpy as np
 WIN_NAME = ("Video Truth Player - Space: Play/Pause, Arrows: Frame, "
             "o/l: Takeoff/Landing, t/f: LED on/off, c: Flag, u: Delete, "
             ",/.: Prev/Next mark, s: Save, q: Quit")
-TRACKBAR_NAME = "Playback mode (0=real time, 1-10=skip)"
+TRACKBAR_NAME = "Playback mode"
 
 MAX_START_W = 1280  # start window: max. width
 MAX_START_H = 720   # start window: max. height
@@ -86,6 +91,7 @@ REF_W, REF_H = 1280, 720
 UI_SCALE_MIN, UI_SCALE_MAX = 0.5, 2.0
 MIN_CANVAS_W, MIN_CANVAS_H = 160, 120
 BAR_H = 26          # height of the timeline at the bottom
+CAPTION_H = 20      # caption strip below the timeline (labels the slider)
 FONT = cv2.FONT_HERSHEY_SIMPLEX
 
 VIEW_CACHE_BYTES = 256 * 1024 * 1024  # budget for cached, window-sized frames
@@ -119,6 +125,8 @@ ORANGE = (0, 120, 255)   # banner: marked frame
 DARK_RED = (0, 0, 170)   # banner: marked frame with illogical sequence
 BAR_BG = (60, 60, 60)      # timeline: unplayed part (dark grey)
 BAR_FILL = (170, 170, 170)  # timeline: played part (light grey, distinct from tick colors)
+CAPTION_BG = (35, 35, 35)  # strip under the timeline that labels the slider
+CAPTION_FG = (200, 200, 200)
 
 KEY_RIGHT = 2555904
 KEY_LEFT = 2424832
@@ -985,11 +993,16 @@ def main():
     print(CONTROLS)
 
     # WINDOW_NORMAL instead of AUTOSIZE: window freely resizable.
+    # WINDOW_FREERATIO: the Qt/Wayland backends otherwise keep the *image*
+    # aspect ratio (KEEPRATIO is the default) and shrink the image view to it
+    # on every resize, centring it in the window -> grey bands around the
+    # video that never go away, because the size is read back below.
     # WINDOW_GUI_NORMAL: on the Qt backend (Linux wheels) OpenCV otherwise draws
     # its own toolbar/statusbar (WINDOW_GUI_EXPANDED is the default there) and
     # that toolbar steals the focus, so arrow keys no longer reach waitKey().
     # No effect on the Windows (Win32) backend.
-    cv2.namedWindow(WIN_NAME, cv2.WINDOW_NORMAL | cv2.WINDOW_GUI_NORMAL)
+    cv2.namedWindow(WIN_NAME, cv2.WINDOW_NORMAL | cv2.WINDOW_GUI_NORMAL |
+                    cv2.WINDOW_FREERATIO)
 
     # start size: at most MAX_START_W x MAX_START_H, aspect ratio preserved
     start_scale = min(MAX_START_W / frame_w, MAX_START_H / frame_h, 1.0)
@@ -1003,7 +1016,7 @@ def main():
     play_start_idx = None
 
     seek_state = {"seek": -1, "scrubbing": False, "hover": -1,
-                  "total": total_frames, "bar_y0": canvas_size[1],
+                  "total": total_frames, "bar_y0": canvas_size[1], "bar_h": 0,
                   "width": canvas_size[0], "enabled": frames_known}
 
     # derived data, recomputed only when annotations change
@@ -1019,7 +1032,7 @@ def main():
         w = param["width"]
         frac = min(max(x / max(w - 1, 1), 0.0), 1.0)
         target = int(round(frac * (param["total"] - 1)))
-        in_bar = y >= param["bar_y0"]
+        in_bar = param["bar_y0"] <= y < param["bar_y0"] + param["bar_h"]
         if event == cv2.EVENT_LBUTTONDOWN and in_bar:
             param["scrubbing"] = True
             param["seek"] = target
@@ -1125,12 +1138,14 @@ def main():
         return bar_cache["grey"], bar_cache["fill"]
 
     def render():
-        """Compose the window image: frame, overlay, banner, timeline."""
+        """Compose the window image: frame, overlay, banner, timeline, caption."""
         cw, ch = canvas_size
         s = ui_scale(cw, ch)
-        bar_h = min(max(10, int(round(BAR_H * s))), ch)
-        bar_y0 = ch - bar_h
-        seek_state["bar_y0"], seek_state["width"] = bar_y0, cw
+        cap_h = min(max(0, int(round(CAPTION_H * s))), max(0, ch // 4))
+        bar_h = min(max(10, int(round(BAR_H * s))), max(1, ch - cap_h))
+        bar_y0 = ch - cap_h - bar_h
+        seek_state["bar_y0"], seek_state["bar_h"], seek_state["width"] = (
+            bar_y0, bar_h, cw)
         pad = int(round(10 * s))
         idx = src.idx
 
@@ -1174,7 +1189,7 @@ def main():
 
         # timeline: cached layers, fill up to the current position
         grey, fill = bar_layers(cw, bar_h, s)
-        bar = canvas[bar_y0:]
+        bar = canvas[bar_y0:bar_y0 + bar_h]
         if frames_known:
             scale = max(total_frames - 1, 1)
             pos_x = int(round(min(idx / scale, 1.0) * (cw - 1)))
@@ -1184,6 +1199,19 @@ def main():
             cv2.rectangle(bar, (pos_x - hw, 0), (pos_x + hw, bar_h), WHITE, -1)
         else:
             bar[:, :] = grey  # no frame count -> no meaningful position
+
+        # caption strip below the timeline: labels the trackbar below the
+        # window. The trackbar has no visible label of its own on every
+        # backend (Qt hides/shortens it), so the slider is explained here.
+        if cap_h > 1:
+            caption = canvas[bar_y0 + bar_h:]
+            caption[:] = CAPTION_BG
+            sc, th = 0.55 * s, max(1, thick(s, 1))
+            put_text(canvas,
+                     fit_text("Playback mode (slider below): 0 = real time, "
+                              "1-10 = every n-th frame", cw - 2 * pad, sc, th),
+                     pad, bar_y0 + bar_h + (cap_h + text_height(sc, th)) // 2 - 1,
+                     sc, CAPTION_FG, th)
 
         # hover: frame/time (and mark) under the mouse
         hover = seek_state["hover"]

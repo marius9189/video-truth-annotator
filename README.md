@@ -30,7 +30,7 @@ Built entirely on **OpenCV** (plus NumPy, which OpenCV needs anyway) – no GUI 
 - **Jump between annotations**: `PageDown`/`.` and `PageUp`/`,` skip directly to the next/previous mark (handy for reviewing flags); playback pauses while jumping
 - **Automatic, atomic saving**: after every change the data is written to the events CSV (first `.tmp`, then `os.replace()`) – **no data loss on crash**, never half-finished CSV files
 - **Writes only on change**: the CSV is rewritten only when annotations actually changed; opening and closing a video without changes leaves all files untouched
-- **Freely resizable window** (`WINDOW_NORMAL`); 4K videos are scaled down to max. 1280×720 at startup (aspect ratio is preserved)
+- **Freely resizable window** (`WINDOW_NORMAL` + `WINDOW_FREERATIO`); 4K videos are scaled down to max. 1280×720 at startup (aspect ratio is preserved)
 - **Fast with large videos**: the frame is scaled to the window size before the overlay is drawn, so the overlay looks the same for every video resolution; recently shown frames are cached, so stepping backwards is instant; the window is only redrawn when something visible changes
 - **Output folder** (`--output-dir`) and **annotator name** (`--annotator`) in the CSV header
 - **Caps Lock friendly**: letter keys work regardless of Caps Lock state (uppercase input is normalised)
@@ -95,7 +95,7 @@ Notes:
 | **`1`–`9`, `0`** | Show every n-th frame (1–10), switches to SKIP |
 | **`q` / `ESC`** | Quit (saves automatically) |
 
-The playback mode can also be selected with the **slider below the video** (trackbar): position 0 = real time, position 1–10 = skip. Every change is saved immediately. When quitting via the window's X button or `q`/`ESC`, a save that failed earlier (e.g. CSV locked in Excel) is retried once more; without changes nothing is written (`Finished. No changes, CSV not rewritten.`).
+The playback mode can also be selected with the **slider below the video** (trackbar): position 0 = real time, position 1–10 = skip. The strip below the timeline labels the slider (the trackbar's own label is not reliably visible on every OpenCV backend). Every change is saved immediately. When quitting via the window's X button or `q`/`ESC`, a save that failed earlier (e.g. CSV locked in Excel) is retried once more; without changes nothing is written (`Finished. No changes, CSV not rewritten.`).
 
 `PageDown`/`.` and `PageUp`/`,` jump to the next/previous annotated frame (pausing playback). Without an earlier mark, `PageUp`/`,` jumps to the start of the video; without a later mark, `PageDown`/`.` prints a note and stays put. Shift/Ctrl + arrow combinations are **not** usable for this: OpenCV's `waitKeyEx` only reports the bare arrow key code on Windows and drops the modifier, so dedicated keys are used instead.
 
