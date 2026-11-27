@@ -2,7 +2,7 @@
 # /// script
 # requires-python = ">=3.9"
 # dependencies = [
-#     "opencv-python>=4.5",
+#     "opencv-python>=4.9",
 #     "numpy",
 # ]
 # ///
@@ -60,6 +60,8 @@ waitKeyEx are backend-specific: the Win32 backend reports virtual key codes
 upper bits of the code, which is masked off on Linux, so Caps Lock and
 Num Lock do not break the keys either (uppercase input is normalised to
 lowercase).
+OpenCV >= 4.9 is required: earlier Qt builds (the Linux wheels) stop
+delivering arrow keys after a click into the image (OpenCV issue #20215).
 
 After every change to the annotations, the data is automatically and
 atomically saved to the events CSV (no data loss on crash).
