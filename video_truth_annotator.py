@@ -2,7 +2,7 @@
 # /// script
 # requires-python = ">=3.9"
 # dependencies = [
-#     "opencv-python>=4.5",
+#     "opencv-python>=4.9",
 #     "numpy",
 # ]
 # ///
@@ -26,7 +26,7 @@ the video itself does not report are skipped in the check.
 
 Key controls: printed with --controls.
 
-Playback mode (also selectable via the slider below the video):
+Playback mode (keys m and 1-10):
   REALTIME : target time of each frame from an absolute time counter; if
              decoding cannot keep up, frames are skipped (decoded without
              display, or a seek for large gaps), never slower than real time.
@@ -40,14 +40,28 @@ Timeline:
   magenta, LED on yellow, LED off orange), RED ticks = illogical sequence (two takeoffs or two landings directly in a row, without the
   respective counterpart in between).
 
-Window freely resizable (WINDOW_NORMAL); 4K videos are scaled down to a
-maximum of 1280x720 at startup, aspect ratio is preserved. The frame is
-scaled to the window before the overlay is drawn, so the overlay has the
-same size for every video resolution, and recently shown frames are cached
-so stepping backwards does not need a seek.
+Window freely resizable (WINDOW_NORMAL + WINDOW_FREERATIO); 4K videos are
+scaled down to a maximum of 1280x720 at startup, aspect ratio is preserved.
+The frame is scaled to the window before the overlay is drawn, so the overlay
+has the same size for every video resolution, and recently shown frames are
+cached so stepping backwards does not need a seek. WINDOW_FREERATIO is
+required on the Qt/Wayland backends (Linux packages), where keeping the
+image ratio (WINDOW_KEEPRATIO) is the default: they shrink the image view to
+the image's aspect ratio and centre it in the window, leaving grey bands
+around the video.
+On the Qt backend (Linux packages) OpenCV's own toolbar and statusbar are
+disabled (WINDOW_GUI_NORMAL): they are useless here and steal the focus, after
+which the arrow keys no longer reach the player on Linux.
 For frame-by-frame annotation the playback mode is irrelevant:
-all frames remain individually addressable (arrow keys). Letter keys also
-work with Caps Lock enabled (uppercase input is normalised to lowercase).
+all frames remain individually addressable (arrow keys). Key codes from
+waitKeyEx are backend-specific: the Win32 backend reports virtual key codes
+(0x250000 = Left), the GTK and Qt backends on Linux report X11 keysyms
+(65361 = Left); both are accepted. GTK packs the modifier state into the
+upper bits of the code, which is masked off on Linux, so Caps Lock and
+Num Lock do not break the keys either (uppercase input is normalised to
+lowercase).
+OpenCV >= 4.9 is required: earlier Qt builds (the Linux wheels) stop
+delivering arrow keys after a click into the image (OpenCV issue #20215).
 
 After every change to the annotations, the data is automatically and
 atomically saved to the events CSV (no data loss on crash).
@@ -72,7 +86,6 @@ import numpy as np
 WIN_NAME = ("Video Truth Player - Space: Play/Pause, Arrows: Frame, "
             "o/l: Takeoff/Landing, t/f: LED on/off, c: Flag, u: Delete, "
             ",/.: Prev/Next mark, s: Save, q: Quit")
-TRACKBAR_NAME = "Playback mode (0=real time, 1-10=skip)"
 
 MAX_START_W = 1280  # start window: max. width
 MAX_START_H = 720   # start window: max. height
@@ -117,12 +130,17 @@ DARK_RED = (0, 0, 170)   # banner: marked frame with illogical sequence
 BAR_BG = (60, 60, 60)      # timeline: unplayed part (dark grey)
 BAR_FILL = (170, 170, 170)  # timeline: played part (light grey, distinct from tick colors)
 
-KEY_RIGHT = 2555904
-KEY_LEFT = 2424832
-KEY_UP = 2490368
-KEY_DOWN = 2621440
-KEY_PAGE_UP = 2162688
-KEY_PAGE_DOWN = 2228224
+# waitKeyEx codes of the non-ASCII keys, per backend (the docs say the codes
+# are backend-specific). Win32: virtual key code in the high word (0x250000 =
+# VK_LEFT). GTK and Qt (X11 and Wayland; Qt reports the X11 keysym as
+# nativeVirtualKey) return the X11 keysym (0xFF51 = Left).
+NO_KEY = 0xFFFFFFFF
+KEY_LEFT_KEYS = (0x250000, 0xFF51)
+KEY_UP_KEYS = (0x260000, 0xFF52)
+KEY_RIGHT_KEYS = (0x270000, 0xFF53)
+KEY_DOWN_KEYS = (0x280000, 0xFF54)
+KEY_PAGE_UP_KEYS = (0x210000, 0xFF55)
+KEY_PAGE_DOWN_KEYS = (0x220000, 0xFF56)
 
 CSV_SEP = ";"
 COMMENT_PREFIX = "#"
@@ -160,10 +178,28 @@ Mouse: click/drag the timeline to jump/scrub, hover it to see frame and time."""
 
 
 def normalize_key(key):
-    """Normalise letter keys to lowercase so Caps Lock does not break input."""
+    """
+    Make waitKeyEx codes comparable.
+
+    GTK packs the X modifier state into the upper 16 bits of the code
+    (`keyval | state << 16`), so with Caps Lock or Num Lock on, even arrow
+    keys and letters arrive with high bits set. Qt and Win32 do not do that;
+    only Linux is masked.
+    Letter keys are lowercased so Caps Lock does not break input.
+    """
+    if sys.platform.startswith("linux"):
+        key &= 0xFFFF
     if ord('A') <= key <= ord('Z'):
         return key | 0x20  # ASCII: to lowercase
     return key
+
+
+def read_key(delay_ms):
+    """waitKeyEx with normalised key codes; NO_KEY when nothing was pressed."""
+    key = cv2.waitKeyEx(delay_ms) & 0xFFFFFFFF
+    if key == NO_KEY:
+        return key
+    return normalize_key(key)
 
 
 def fmt_time(sec):
@@ -338,8 +374,8 @@ def edit_flag_text(base_display, event_name, initial, history, bar_h):
                          YELLOW if selected else (200, 200, 200), sugg_t)
             cv2.imshow(WIN_NAME, display)
             dirty = False
-        key = cv2.waitKeyEx(PAUSED_POLL_MS) & 0xFFFFFFFF
-        if key == 0xFFFFFFFF:
+        key = read_key(PAUSED_POLL_MS)
+        if key == NO_KEY:
             continue                   # no key pressed
         dirty = True
         if key in (13, 10):            # Enter -> commit
@@ -350,11 +386,11 @@ def edit_flag_text(base_display, event_name, initial, history, bar_h):
             text = text[:-1]
             prefix = text
             pick = -1
-        elif key == KEY_DOWN:          # next suggestion into the input
+        elif key in KEY_DOWN_KEYS:     # next suggestion into the input
             if matches:
                 pick = 0 if pick < 0 else (pick + 1) % len(matches)
                 text = matches[pick]
-        elif key == KEY_UP:            # previous suggestion
+        elif key in KEY_UP_KEYS:       # previous suggestion
             if matches:
                 pick = len(matches) - 1 if pick < 0 else (pick - 1) % len(matches)
                 text = matches[pick]
@@ -981,8 +1017,17 @@ def main():
     frame_h, frame_w = src.raw.shape[:2]
     print(CONTROLS)
 
-    # WINDOW_NORMAL instead of AUTOSIZE: window freely resizable
-    cv2.namedWindow(WIN_NAME, cv2.WINDOW_NORMAL)
+    # WINDOW_NORMAL instead of AUTOSIZE: window freely resizable.
+    # WINDOW_FREERATIO: the Qt/Wayland backends otherwise keep the *image*
+    # aspect ratio (KEEPRATIO is the default) and shrink the image view to it
+    # on every resize, centring it in the window -> grey bands around the
+    # video that never go away, because the size is read back below.
+    # WINDOW_GUI_NORMAL: on the Qt backend (Linux wheels) OpenCV otherwise draws
+    # its own toolbar/statusbar (WINDOW_GUI_EXPANDED is the default there) and
+    # that toolbar steals the focus, so arrow keys no longer reach waitKey().
+    # No effect on the Windows (Win32) backend.
+    cv2.namedWindow(WIN_NAME, cv2.WINDOW_NORMAL | cv2.WINDOW_GUI_NORMAL |
+                    cv2.WINDOW_FREERATIO)
 
     # start size: at most MAX_START_W x MAX_START_H, aspect ratio preserved
     start_scale = min(MAX_START_W / frame_w, MAX_START_H / frame_h, 1.0)
@@ -1074,19 +1119,16 @@ def main():
             return "REALTIME"
         return f"SKIP x{skip_step} (every {skip_step}.)"
 
-    def apply_mode(new_mode, new_step, sync_trackbar):
+    def apply_mode(new_mode, new_step):
         """Switch playback mode; restart the clock so playback does not jump."""
         nonlocal play_mode, skip_step
         if new_mode == play_mode and (new_mode == MODE_REALTIME or new_step == skip_step):
-            return  # no change -> do nothing (no console spam while dragging)
+            return  # no change -> do nothing (no console spam)
         if new_mode == MODE_SKIP:
             skip_step = new_step
         play_mode = new_mode
         if not paused:
             restart_clock()
-        if sync_trackbar:
-            cv2.setTrackbarPos(TRACKBAR_NAME, WIN_NAME,
-                               0 if play_mode == MODE_REALTIME else skip_step)
         print(f"Playback mode: {mode_text()}")
 
     def events_changed():
@@ -1178,6 +1220,7 @@ def main():
         else:
             bar[:, :] = grey  # no frame count -> no meaningful position
 
+
         # hover: frame/time (and mark) under the mouse
         hover = seek_state["hover"]
         if frames_known and hover >= 0:
@@ -1194,13 +1237,6 @@ def main():
             cv2.rectangle(canvas, (bx, by), (bx + bw, by + bh), (40, 40, 40), -1)
             put_text(canvas, tip, bx + pad, by + bh - pad // 2 - 2, sc, WHITE, th)
         return canvas
-
-    # Slider below the video window: position 0 = real time,
-    # positions 1-10 = every n-th frame (SKIP). OpenCV HighGUI has no
-    # dropdown menus; a trackbar is the closest control element.
-    cv2.createTrackbar(TRACKBAR_NAME, WIN_NAME, skip_step, 10,
-                       lambda pos: apply_mode(
-                           MODE_REALTIME if pos <= 0 else MODE_SKIP, pos, False))
 
     canvas = None
     last_render_key = None
@@ -1239,7 +1275,7 @@ def main():
                 restart_clock()
                 elapsed, due = 0.0, 1.0 / fps
             wait_ms = max(1, int(round((due - elapsed) * 1000)))
-        key = cv2.waitKeyEx(wait_ms) & 0xFFFFFFFF
+        key = read_key(wait_ms)
 
         # process timeline seek (pauses automatically)
         if seek_state["seek"] >= 0:
@@ -1247,34 +1283,32 @@ def main():
             src.goto(seek_state["seek"])
             seek_state["seek"] = -1
 
-        key = normalize_key(key)  # Caps Lock: letters arrive uppercase
-
         if key == ord('q') or key == 27:
             break
         elif key == 32:  # space bar
             paused = not paused
             if not paused:
                 restart_clock()
-        elif key == KEY_RIGHT or key == ord('d'):
+        elif key in KEY_RIGHT_KEYS or key == ord('d'):
             # at the known end, stay put, no faulty seek
             if not (frames_known and src.idx >= total_frames - 1):
                 paused = True
                 src.goto(src.idx + 1)
-        elif key == KEY_LEFT or key == ord('a'):
+        elif key in KEY_LEFT_KEYS or key == ord('a'):
             paused = True
             if src.idx > 0:
                 src.goto(src.idx - 1)
-        elif key == KEY_PAGE_DOWN or key == ord('.'):
+        elif key in KEY_PAGE_DOWN_KEYS or key == ord('.'):
             jump_to_annotation(1)
-        elif key == KEY_PAGE_UP or key == ord(','):
+        elif key in KEY_PAGE_UP_KEYS or key == ord(','):
             jump_to_annotation(-1)
         elif key == ord('m'):
             apply_mode(MODE_SKIP if play_mode == MODE_REALTIME else MODE_REALTIME,
-                       skip_step, True)
+                       skip_step)
         elif ord('1') <= key <= ord('9'):  # skip step 1-9
-            apply_mode(MODE_SKIP, key - ord('0'), True)
+            apply_mode(MODE_SKIP, key - ord('0'))
         elif key == ord('0'):  # skip step 10
-            apply_mode(MODE_SKIP, 10, True)
+            apply_mode(MODE_SKIP, 10)
         elif key in (ord('o'), ord('l'), ord('t'), ord('f')):
             idx = src.idx
             name = {ord('o'): "Takeoff", ord('l'): "Landing",
