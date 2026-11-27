@@ -53,8 +53,13 @@ On the Qt backend (Linux packages) OpenCV's own toolbar and statusbar are
 disabled (WINDOW_GUI_NORMAL): they are useless here and steal the focus, after
 which the arrow keys no longer reach the player on Linux.
 For frame-by-frame annotation the playback mode is irrelevant:
-all frames remain individually addressable (arrow keys). Letter keys also
-work with Caps Lock enabled (uppercase input is normalised to lowercase).
+all frames remain individually addressable (arrow keys). Key codes from
+waitKeyEx are backend-specific: the Win32 backend reports virtual key codes
+(0x250000 = Left), the GTK and Qt backends on Linux report X11 keysyms
+(65361 = Left); both are accepted. GTK packs the modifier state into the
+upper bits of the code, which is masked off on Linux, so Caps Lock and
+Num Lock do not break the keys either (uppercase input is normalised to
+lowercase).
 
 After every change to the annotations, the data is automatically and
 atomically saved to the events CSV (no data loss on crash).
@@ -123,12 +128,17 @@ DARK_RED = (0, 0, 170)   # banner: marked frame with illogical sequence
 BAR_BG = (60, 60, 60)      # timeline: unplayed part (dark grey)
 BAR_FILL = (170, 170, 170)  # timeline: played part (light grey, distinct from tick colors)
 
-KEY_RIGHT = 2555904
-KEY_LEFT = 2424832
-KEY_UP = 2490368
-KEY_DOWN = 2621440
-KEY_PAGE_UP = 2162688
-KEY_PAGE_DOWN = 2228224
+# waitKeyEx codes of the non-ASCII keys, per backend (the docs say the codes
+# are backend-specific). Win32: virtual key code in the high word (0x250000 =
+# VK_LEFT). GTK and Qt (X11 and Wayland; Qt reports the X11 keysym as
+# nativeVirtualKey) return the X11 keysym (0xFF51 = Left).
+NO_KEY = 0xFFFFFFFF
+KEY_LEFT_KEYS = (0x250000, 0xFF51)
+KEY_UP_KEYS = (0x260000, 0xFF52)
+KEY_RIGHT_KEYS = (0x270000, 0xFF53)
+KEY_DOWN_KEYS = (0x280000, 0xFF54)
+KEY_PAGE_UP_KEYS = (0x210000, 0xFF55)
+KEY_PAGE_DOWN_KEYS = (0x220000, 0xFF56)
 
 CSV_SEP = ";"
 COMMENT_PREFIX = "#"
@@ -166,10 +176,28 @@ Mouse: click/drag the timeline to jump/scrub, hover it to see frame and time."""
 
 
 def normalize_key(key):
-    """Normalise letter keys to lowercase so Caps Lock does not break input."""
+    """
+    Make waitKeyEx codes comparable.
+
+    GTK packs the X modifier state into the upper 16 bits of the code
+    (`keyval | state << 16`), so with Caps Lock or Num Lock on, even arrow
+    keys and letters arrive with high bits set. Qt and Win32 do not do that;
+    only Linux is masked.
+    Letter keys are lowercased so Caps Lock does not break input.
+    """
+    if sys.platform.startswith("linux"):
+        key &= 0xFFFF
     if ord('A') <= key <= ord('Z'):
         return key | 0x20  # ASCII: to lowercase
     return key
+
+
+def read_key(delay_ms):
+    """waitKeyEx with normalised key codes; NO_KEY when nothing was pressed."""
+    key = cv2.waitKeyEx(delay_ms) & 0xFFFFFFFF
+    if key == NO_KEY:
+        return key
+    return normalize_key(key)
 
 
 def fmt_time(sec):
@@ -344,8 +372,8 @@ def edit_flag_text(base_display, event_name, initial, history, bar_h):
                          YELLOW if selected else (200, 200, 200), sugg_t)
             cv2.imshow(WIN_NAME, display)
             dirty = False
-        key = cv2.waitKeyEx(PAUSED_POLL_MS) & 0xFFFFFFFF
-        if key == 0xFFFFFFFF:
+        key = read_key(PAUSED_POLL_MS)
+        if key == NO_KEY:
             continue                   # no key pressed
         dirty = True
         if key in (13, 10):            # Enter -> commit
@@ -356,11 +384,11 @@ def edit_flag_text(base_display, event_name, initial, history, bar_h):
             text = text[:-1]
             prefix = text
             pick = -1
-        elif key == KEY_DOWN:          # next suggestion into the input
+        elif key in KEY_DOWN_KEYS:     # next suggestion into the input
             if matches:
                 pick = 0 if pick < 0 else (pick + 1) % len(matches)
                 text = matches[pick]
-        elif key == KEY_UP:            # previous suggestion
+        elif key in KEY_UP_KEYS:       # previous suggestion
             if matches:
                 pick = len(matches) - 1 if pick < 0 else (pick - 1) % len(matches)
                 text = matches[pick]
@@ -1245,7 +1273,7 @@ def main():
                 restart_clock()
                 elapsed, due = 0.0, 1.0 / fps
             wait_ms = max(1, int(round((due - elapsed) * 1000)))
-        key = cv2.waitKeyEx(wait_ms) & 0xFFFFFFFF
+        key = read_key(wait_ms)
 
         # process timeline seek (pauses automatically)
         if seek_state["seek"] >= 0:
@@ -1253,26 +1281,24 @@ def main():
             src.goto(seek_state["seek"])
             seek_state["seek"] = -1
 
-        key = normalize_key(key)  # Caps Lock: letters arrive uppercase
-
         if key == ord('q') or key == 27:
             break
         elif key == 32:  # space bar
             paused = not paused
             if not paused:
                 restart_clock()
-        elif key == KEY_RIGHT or key == ord('d'):
+        elif key in KEY_RIGHT_KEYS or key == ord('d'):
             # at the known end, stay put, no faulty seek
             if not (frames_known and src.idx >= total_frames - 1):
                 paused = True
                 src.goto(src.idx + 1)
-        elif key == KEY_LEFT or key == ord('a'):
+        elif key in KEY_LEFT_KEYS or key == ord('a'):
             paused = True
             if src.idx > 0:
                 src.goto(src.idx - 1)
-        elif key == KEY_PAGE_DOWN or key == ord('.'):
+        elif key in KEY_PAGE_DOWN_KEYS or key == ord('.'):
             jump_to_annotation(1)
-        elif key == KEY_PAGE_UP or key == ord(','):
+        elif key in KEY_PAGE_UP_KEYS or key == ord(','):
             jump_to_annotation(-1)
         elif key == ord('m'):
             apply_mode(MODE_SKIP if play_mode == MODE_REALTIME else MODE_REALTIME,
